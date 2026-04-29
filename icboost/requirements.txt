@@ -2,3 +2,7 @@
 # Interprete: Python 3.10 o superiore (consigliato 3.11 / 3.12 su Windows).
 
 pillow>=9.0
+
+# Sviluppo / test (opzionale): dalla cartella icboost
+#   pip install -e ".[dev]"
+# oppure: pip install pytest

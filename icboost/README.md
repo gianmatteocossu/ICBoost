@@ -43,10 +43,22 @@ hw.StartTP(numberOfRepetition=10)
 - **Guida principale** (indice, API per settore, builtin, macro, esempi e flussi): [`docs/GUIDA_HW_E_MACRO.md`](docs/GUIDA_HW_E_MACRO.md)
 - **Puntatore rapido**: [`docs/HW_API_REFERENCE.md`](docs/HW_API_REFERENCE.md)
 - **Macro** (`source nome.py` dalla GUI): [`examples/macros/README.md`](examples/macros/README.md)
+- **Piano debug (checklist HW)**: [`docs/DEBUG_SESSION_PIANO.md`](docs/DEBUG_SESSION_PIANO.md)
+- **MAT / pixel cross-check con C#**: [`docs/MAT_PIXEL_MAP_CSHARP_XREF.md`](docs/MAT_PIXEL_MAP_CSHARP_XREF.md)
+
+### Test automatici (senza hardware)
+
+Dalla cartella `icboost`:
+
+```text
+pip install -e ".[dev]"
+pytest
+```
 
 ### Note importanti (mappatura dal C#)
 - **Selezione quadrante**: tramite MUX I2C (bitmask: SW=1, NW=2, SE=4, NE=8).
 - **Addressing MAT**: nel tool C# l'indirizzo I2C del MAT è `MatID*2` (MatID 0..15).
+- **Mat “owner” analog per blocco 2×2**: **1, 3, 9, 11** (come `MainForm.cs` e `BlockMapping` in GUI Python) — **non** confondere con gli angoli indice 0, 2, 8, 10.
 - **Registri MAT**:
   - `PIX` config: registro = `PixID` (0..63), layout: `FE_ON` bit7, `PIXON` bit6, `adj` bits5..4, `ctrl` bits3..0
   - DAC interni: reg 70..75 (`VTH_H`, `VTH_L`, `VINJ_H`, `VINJ_L`, `VLDO`, `VFB`), layout: enable bit7 + code 0..127

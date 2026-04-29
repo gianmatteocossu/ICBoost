@@ -11,9 +11,19 @@ dependencies = [
   "pillow",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
 [tool.setuptools]
 packages = ["icboost"]
 
 [tool.setuptools.package-data]
 icboost = ["assets/*.png", "assets/*.jpg", "assets/*.jpeg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
 
