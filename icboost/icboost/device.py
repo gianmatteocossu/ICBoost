@@ -371,8 +371,15 @@ class Ignite64LowLevel:
         write default values to IO extender dev 0x40 regs 0..10:
         reg0=0x80, reg5=0x20, reg9=0x34, reg10=0x40, others 0.
         """
-        # Autodetect IOext address first (0x40 vs 0xAE)
-        dev = self.autodetect_ioext_address(retries=5, delay_s=0.05)
+        # Autodetect IOext address first (0x40 vs 0xAE).
+        # Anche se l'istanza è in modalità "strict", qui vogliamo comunque
+        # provare entrambi per evitare blocchi all'avvio (se l'hardware usa 0xAE).
+        candidates: list[int] = []
+        for a in (int(self.addr.ioext_addr), 0x40, 0xAE):
+            a = int(a) & 0xFF
+            if a not in candidates:
+                candidates.append(a)
+        dev = self.autodetect_ioext_address(candidates=candidates, retries=5, delay_s=0.05)
         defaults = [0x00] * 11
         defaults[0] = 0x80
         defaults[5] = 0x20
