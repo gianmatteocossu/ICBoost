@@ -12,13 +12,16 @@ from pathlib import Path
 from typing import Optional
 
 from .api import Ignite64
-from .calib_dco import CalibDCOParams
+from .calib_dco import CalibDCOParams, raw_fifo_to_fields
 
 # Prefer user-supplied JPEG in assets/, then legacy PNG name.
 _DIE_PHOTO_NAMES: tuple[str, ...] = ("ignite64.jpg", "ignite64.jpeg", "ignite64_die_photo.png")
+# Banner IGNITE μd / INFN for Quadrants home (PNG).
+_BANNER_IMAGE_NAMES: tuple[str, ...] = ("ignite_ud_banner.png",)
 
 # Centered square on bitmap: linear extent ½ × ½ → area = ¼ of photo (NW/NE/SW/SE each = ¹⁄₁₆ of bitmap).
-_DEFAULT_DIE_CHIP_BOX: tuple[float, float, float, float] = (0.25, 0.25, 0.75, 0.75)
+# Hint su bitmap per l’area attiva (può essere rettangolare); in GUI viene inscritto un quadrato = matrice 4 quadranti.
+_DEFAULT_DIE_CHIP_BOX: tuple[float, float, float, float] = (0.20, 0.28, 0.80, 0.84)
 
 # Optional dashed outline on the photo for the “TOP / periphery” band (normalized bitmap coords).
 _DEFAULT_DIE_TOP_BAND: tuple[float, float, float, float] = (0.03, 0.70, 0.97, 0.97)
@@ -126,6 +129,49 @@ def _quad_from_uv_in_chip_box(u: float, v: float, box: tuple[float, float, float
     if north:
         return "NW" if west else "NE"
     return "SW" if west else "SE"
+
+
+def _die_matrix_box_square(box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """
+    Inscrive un quadrato nel rettangolo ``IGNITE_DIE_CHIP_BOX`: il riquadro rosso segue la **matrice**
+    (4 quadranti), non necessariamente tutto il die/package sul JPEG.
+    """
+    bl, bt, br, bb = box
+    w = float(br - bl)
+    h = float(bb - bt)
+    if w <= 1e-9 or h <= 1e-9:
+        return box
+    s = min(w, h)
+    cx = (bl + br) * 0.5
+    cy = (bt + bb) * 0.5
+    hl = s * 0.5
+    nl = cx - hl
+    nt = cy - hl
+    nr = cx + hl
+    nb = cy + hl
+    return (
+        max(0.0, min(1.0, nl)),
+        max(0.0, min(1.0, nt)),
+        max(0.0, min(1.0, nr)),
+        max(0.0, min(1.0, nb)),
+    )
+
+
+def _die_resolve_top_band(matrix_box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """
+    Fascia TOP (blu): se ``IGNITE_DIE_TOP_BAND`` è impostato → uso legacy.
+    Altrimenti rettangolo **alto** sopra la matrice: stessa larghezza del quadrato rosso (bl..br),
+    dal margine superiore bitmap fino al **bordo superiore** della matrice (bt), così il lato inferiore
+    della fascia coincide col lato superiore del quadrato rosso.
+    """
+    raw = os.environ.get("IGNITE_DIE_TOP_BAND", "").strip()
+    if raw:
+        return _parse_die_top_band()
+    bl, bt, br, _bb = matrix_box
+    tt = 0.03
+    if bt <= tt + 0.02:
+        tt = max(0.0, bt - 0.12)
+    return (bl, tt, br, bt)
 
 
 def _bootstrap_die_photo_env() -> None:
@@ -408,8 +454,8 @@ class Ignite64Gui(tk.Tk):
         self.hw = hw
         self.offline = bool(offline)
         self.mapping = mapping or BlockMapping()
-        self.title("IGNITE64 monitor (tk)")
-        self.geometry("1200x820")
+        self.title("IGNITE64 ASIC")
+        self.geometry("1400x900")
 
         # Match root window to ttk frame background (avoids default Tk dark fill around widgets on some platforms).
         try:
@@ -439,10 +485,12 @@ class Ignite64Gui(tk.Tk):
         self._quad_monitor_canvas: dict[str, str] = {q: "" for q in ("NW", "NE", "SW", "SE")}
         self._die_canvas_redraw: Optional[object] = None
         self._top_snapshot_texts: dict[str, tk.Text] = {}
-        self._quadrants_top_mon_var = tk.StringVar(value="TOP (lettura): —")
+        self._quadrants_top_mon_var = tk.StringVar(value="TOP (read): —")
         self._quadrants_top_mon_job: Optional[str] = None
         self._quadrants_top_mon_seq: int = 0
         self._macro_script_paths: list[Path] = []
+        self._home_quad_mon_texts: Optional[dict[str, tk.Text]] = None
+        self._banner_photo_ref: Optional[object] = None
         # Cache "snapshot" per aggiornare subito la view Block (pix ON + codice FTDAC)
         # dopo la configurazione di base all'apertura GUI.
         self._mat_snapshot_cache: dict[str, dict[int, dict[str, object]]] = {q: {} for q in ("NW", "NE", "SW", "SE")}
@@ -451,6 +499,9 @@ class Ignite64Gui(tk.Tk):
         self._snapshot_capture_in_progress: bool = False
         self._analog_power_btn: Optional[tk.Button] = None
         self._mat_snapshot_disable_after_id: Optional[str] = None
+        # Cache for DCO/TDC calibration results (from Calib DCO dialog).
+        # Key: (quad_str, mat_id, pix_id) -> {"dco0_ps": float, "dco1_ps": float, "lsb_ps": float}
+        self._dco_calib_cache: dict[tuple[str, int, int], dict[str, float]] = {}
         # External IREF DAC is write-only; keep last value set for UI "Read" (C# NumericUpDown behavior).
         try:
             _iref0 = float(os.environ.get("IGNITE64_IREF_MV", "900").strip())
@@ -474,11 +525,6 @@ class Ignite64Gui(tk.Tk):
         top_left = ttk.Frame(topbar)
         top_left.pack(side="left")
 
-        ttk.Label(top_left, text="Quadrant:").pack(side="left")
-        quad_box = ttk.Combobox(top_left, textvariable=self.quad_var, values=["SW", "NW", "SE", "NE"], width=6)
-        quad_box.pack(side="left", padx=(6, 12))
-        quad_box.state(["readonly"])
-
         self.back_btn = ttk.Button(top_left, text="Back", command=self.nav_back, state="disabled")
         self.back_btn.pack(side="left", padx=(0, 8))
 
@@ -490,10 +536,17 @@ class Ignite64Gui(tk.Tk):
 
         ttk.Separator(topbar, orient="vertical").pack(side="left", fill="y", padx=8)
 
-        # Cmd + Macro: due righe, colonna centrale larga; Calib DCO solo in alto a destra
+        # Pulsanti HW/calibrazione: frame fisso a destra (non viene schiacciato dalla zona Cmd)
+        top_right = ttk.Frame(topbar)
+        top_right.pack(side="right")
+        ttk.Button(top_right, text="DCO map…", command=self._open_dco_cal_map).pack(side="left", padx=(0, 4))
+        ttk.Button(top_right, text="Calib DCO…", command=self._calib_dco_dialog).pack(side="left", padx=(0, 4))
+        ttk.Button(top_right, text="Reconnect USB", command=self._reconnect_usb).pack(side="left", padx=(0, 0))
+
+        # Cmd + Macro: due righe, colonna centrale larga
         cmd_macro = ttk.Frame(topbar)
         cmd_macro.pack(side="left", fill="both", expand=True, padx=(0, 12))
-        cmd_macro.columnconfigure(1, weight=1, minsize=480)
+        cmd_macro.columnconfigure(1, weight=1, minsize=320)
 
         ttk.Label(cmd_macro, text="Cmd:").grid(row=0, column=0, sticky="e", padx=(0, 6))
         cmd_entry = ttk.Entry(cmd_macro, textvariable=self.cmd_var, width=72)
@@ -510,9 +563,6 @@ class Ignite64Gui(tk.Tk):
 
         self._refresh_macro_file_list()
         self._macro_file_cb.bind("<<ComboboxSelected>>", self._on_macro_file_selected)
-
-        ttk.Button(topbar, text="Reconnect USB", command=self._reconnect_usb).pack(side="right", padx=(0, 4))
-        ttk.Button(topbar, text="Calib DCO…", command=self._calib_dco_dialog).pack(side="right", padx=(4, 0))
 
         self.content = ttk.Frame(root)
         self.content.pack(fill="both", expand=True)
@@ -862,6 +912,49 @@ class Ignite64Gui(tk.Tk):
             "no die image — add icboost/assets/ignite64.jpg (or ignite64_die_photo.png) or set IGNITE_DIE_PHOTO",
         )
 
+    def _load_banner_pil(self, Image_mod: Optional[object] = None) -> tuple[Optional[object], str]:
+        """Logo / banner principale (home Quadrants). Returns (PIL.Image RGBA, path or reason)."""
+        if Image_mod is None:
+            Image_mod, _ImageTk = _maybe_load_pil()
+        if Image_mod is None:
+            return None, "Pillow missing"
+
+        env = os.environ.get("IGNITE64_BANNER_PNG", "").strip().strip('"').strip("'")
+        if env:
+            ep = Path(env)
+            if ep.is_file():
+                try:
+                    return Image_mod.open(str(ep)).convert("RGBA"), str(ep)
+                except Exception as e:
+                    return None, f"IGNITE64_BANNER_PNG: {e}"
+        base = Path(__file__).resolve().parent / "assets"
+        for name in _BANNER_IMAGE_NAMES:
+            fp = base / name
+            if fp.is_file():
+                try:
+                    return Image_mod.open(str(fp)).convert("RGBA"), str(fp)
+                except Exception:
+                    continue
+        try:
+            import importlib.resources as ir
+
+            for name in _BANNER_IMAGE_NAMES:
+                ref = ir.files("icboost").joinpath("assets", name)
+                if ref.is_file():
+                    im = Image_mod.open(io.BytesIO(ref.read_bytes())).convert("RGBA")
+                    return im, f"icboost/assets/{name}"
+        except Exception:
+            pass
+        for name in _BANNER_IMAGE_NAMES:
+            blob = pkgutil.get_data("icboost", f"assets/{name}")
+            if blob:
+                try:
+                    im = Image_mod.open(io.BytesIO(blob)).convert("RGBA")
+                    return im, f"icboost/assets/{name}"
+                except Exception:
+                    continue
+        return None, "no banner — add icboost/assets/ignite_ud_banner.png or set IGNITE64_BANNER_PNG"
+
     # -----------------
     # Navigation helpers
     # -----------------
@@ -902,7 +995,7 @@ class Ignite64Gui(tk.Tk):
         paths = sorted(d.glob("*.py")) if d.is_dir() else []
         self._macro_script_paths = paths
         labels = [p.name for p in paths]
-        self._macro_file_cb["values"] = ["— scegli —"] + labels
+        self._macro_file_cb["values"] = ["— choose —"] + labels
         try:
             self._macro_file_cb.current(0)
         except Exception:
@@ -914,7 +1007,7 @@ class Ignite64Gui(tk.Tk):
             self._set_status("Macro: offline")
             return
         if idx <= 0 or idx - 1 >= len(self._macro_script_paths):
-            self._set_status("Scegli un file .py nella lista Macro")
+            self._set_status("Pick a .py file in the Macro list")
             return
         name = self._macro_script_paths[idx - 1].name
         try:
@@ -991,16 +1084,23 @@ class Ignite64Gui(tk.Tk):
     def _calib_dco_dialog(self) -> None:
         """
         Dialog equivalent to C# `MultiTestSelForm("CalDCO")` + save file, then runs `run_calib_dco` in a worker thread.
+        In modalità offline la finestra si apre comunque (parametri e salvataggio report non eseguono HW).
         """
-        if self.offline:
-            self._set_status("Calib DCO: richiede hardware (offline)")
-            return
-
         win = tk.Toplevel(self)
         win.title("DCO Calibration Settings")
         win.transient(self)
         frm = ttk.Frame(win, padding=12)
         frm.pack(fill="both", expand=True)
+
+        if self.offline:
+            ttk.Label(
+                frm,
+                text="Offline mode: you can set parameters; Start does not run hardware calibration.",
+                foreground="#555555",
+            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            base_row = 1
+        else:
+            base_row = 0
 
         quad_labels = (
             "SW (South-West)",
@@ -1010,32 +1110,33 @@ class Ignite64Gui(tk.Tk):
             "ALL Quadrants",
             "BROADCAST",
         )
-        ttk.Label(frm, text="Quadrante").grid(row=0, column=0, sticky="w", pady=2)
+        br = int(base_row)
+        ttk.Label(frm, text="Quadrant").grid(row=br + 0, column=0, sticky="w", pady=2)
         quad_cb = ttk.Combobox(frm, state="readonly", width=26, values=quad_labels)
         qm = {"SW": 0, "NW": 1, "SE": 2, "NE": 3}
         try:
             quad_cb.current(qm.get(str(self.quad_var.get()).strip().upper(), 0))
         except Exception:
             quad_cb.current(0)
-        quad_cb.grid(row=0, column=1, sticky="ew", pady=2)
+        quad_cb.grid(row=br + 0, column=1, sticky="ew", pady=2)
 
         mat_vals = [f"MAT {i:02d}" for i in range(16)] + ["MAT ALL"]
-        ttk.Label(frm, text="MAT").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text="MAT").grid(row=br + 1, column=0, sticky="w", pady=2)
         mat_cb = ttk.Combobox(frm, state="readonly", width=14, values=mat_vals)
         mat_cb.current(0)
-        mat_cb.grid(row=1, column=1, sticky="w", pady=2)
+        mat_cb.grid(row=br + 1, column=1, sticky="w", pady=2)
 
-        ttk.Label(frm, text="PIX min").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text="PIX min").grid(row=br + 2, column=0, sticky="w", pady=2)
         pix_min_sb = tk.Spinbox(frm, from_=0, to=63, width=8)
         pix_min_sb.delete(0, "end")
         pix_min_sb.insert(0, "0")
-        pix_min_sb.grid(row=2, column=1, sticky="w", pady=2)
+        pix_min_sb.grid(row=br + 2, column=1, sticky="w", pady=2)
 
-        ttk.Label(frm, text="PIX max").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text="PIX max").grid(row=br + 3, column=0, sticky="w", pady=2)
         pix_max_sb = tk.Spinbox(frm, from_=0, to=63, width=8)
         pix_max_sb.delete(0, "end")
         pix_max_sb.insert(0, "63")
-        pix_max_sb.grid(row=3, column=1, sticky="w", pady=2)
+        pix_max_sb.grid(row=br + 3, column=1, sticky="w", pady=2)
 
         all_pix_var = tk.BooleanVar(value=False)
 
@@ -1048,39 +1149,39 @@ class Ignite64Gui(tk.Tk):
                 pix_max_sb.configure(state="normal")
 
         ttk.Checkbutton(frm, text="All PIX (0–63)", variable=all_pix_var, command=_toggle_pix_span).grid(
-            row=4, column=1, sticky="w", pady=2
+            row=br + 4, column=1, sticky="w", pady=2
         )
 
-        ttk.Label(frm, text="Resolution target (ps)").grid(row=5, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text="LSB target (ps)").grid(row=br + 5, column=0, sticky="w", pady=2)
         res_sb = tk.Spinbox(frm, from_=10, to=100, width=8)
         res_sb.delete(0, "end")
         res_sb.insert(0, "30")
-        res_sb.grid(row=5, column=1, sticky="w", pady=2)
+        res_sb.grid(row=br + 5, column=1, sticky="w", pady=2)
 
-        ttk.Label(frm, text="Calibration time (reg 0..3)").grid(row=6, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text="Calibration time (reg 0..3)").grid(row=br + 6, column=0, sticky="w", pady=2)
         cal_t_sb = tk.Spinbox(frm, from_=0, to=3, width=8)
         cal_t_sb.delete(0, "end")
         cal_t_sb.insert(0, "3")
-        cal_t_sb.grid(row=6, column=1, sticky="w", pady=2)
+        cal_t_sb.grid(row=br + 6, column=1, sticky="w", pady=2)
 
         de_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Double edge (DE)", variable=de_var).grid(row=7, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(frm, text="Double edge (DE)", variable=de_var).grid(row=br + 7, column=1, sticky="w", pady=2)
 
-        ttk.Label(frm, text="DCO-0 Adj (0..3)").grid(row=8, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text="DCO-0 Adj (0..3)").grid(row=br + 8, column=0, sticky="w", pady=2)
         adj_sb = tk.Spinbox(frm, from_=0, to=3, width=8)
         adj_sb.delete(0, "end")
         adj_sb.insert(0, "1")
-        adj_sb.grid(row=8, column=1, sticky="w", pady=2)
+        adj_sb.grid(row=br + 8, column=1, sticky="w", pady=2)
 
-        ttk.Label(frm, text="DCO-0 Ctrl (0..15)").grid(row=9, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text="DCO-0 Ctrl (0..15)").grid(row=br + 9, column=0, sticky="w", pady=2)
         ctrl_sb = tk.Spinbox(frm, from_=0, to=15, width=8)
         ctrl_sb.delete(0, "end")
         ctrl_sb.insert(0, "0")
-        ctrl_sb.grid(row=9, column=1, sticky="w", pady=2)
+        ctrl_sb.grid(row=br + 9, column=1, sticky="w", pady=2)
 
         cc_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Calibrate MAT 4–7 (broadcast)", variable=cc_var).grid(
-            row=10, column=1, sticky="w", pady=2
+            row=br + 10, column=1, sticky="w", pady=2
         )
 
         err_var = tk.StringVar(value="")
@@ -1102,12 +1203,17 @@ class Ignite64Gui(tk.Tk):
                 return
 
             if qi == 5:
-                err_var.set("Seleziona un quadrante diverso da BROADCAST.")
+                err_var.set("Select a quadrant other than BROADCAST.")
+                return
+
+            if self.offline:
+                err_var.set("Hardware calibration cannot run in offline mode. Set OFFLINE=0 for a live setup.")
+                self._set_status("Calib DCO: offline — no HW run")
                 return
 
             path = filedialog.asksaveasfilename(
                 parent=win,
-                title="Salva report calibrazione DCO",
+                title="Save DCO calibration report",
                 defaultextension=".txt",
                 filetypes=[("Text", "*.txt"), ("All", "*.*")],
             )
@@ -1133,18 +1239,39 @@ class Ignite64Gui(tk.Tk):
                 return
 
             win.destroy()
-            self._set_status("Calib DCO in esecuzione…")
+            self._set_status("Calib DCO running…")
 
             def work() -> None:
                 def prog(msg: str) -> None:
                     self.after(0, lambda m=msg: self._set_status(m))
 
                 try:
-                    self.hw.run_calib_dco(params, progress=prog)
+                    loaded = self.hw.run_calib_dco(params, progress=prog)
                 except Exception as e:
-                    self.after(0, lambda e=e: self._set_status(f"Calib DCO errore: {e}"))
+                    self.after(0, lambda e=e: self._set_status(f"Calib DCO error: {e}"))
                     return
-                self.after(0, lambda: self._set_status(f"Calib DCO completato → {path}"))
+                # Cache per-pixel results for the FTDAC popup.
+                try:
+                    def _update_cache() -> None:
+                        # Populate only non-zero entries (resolution_matrix is LSB).
+                        for q_idx, q_str in enumerate(("SW", "NW", "SE", "NE")):
+                            for m in range(16):
+                                for pxi in range(64):
+                                    lsb = float(getattr(loaded, "resolution_matrix")[q_idx][m][pxi])  # type: ignore[attr-defined]
+                                    if lsb == 0.0:
+                                        continue
+                                    d0 = float(getattr(loaded, "cal_matrix")[q_idx][m][pxi][0])  # type: ignore[attr-defined]
+                                    d1 = float(getattr(loaded, "cal_matrix")[q_idx][m][pxi][1])  # type: ignore[attr-defined]
+                                    self._dco_calib_cache[(q_str, int(m), int(pxi))] = {
+                                        "dco0_ps": float(d0),
+                                        "dco1_ps": float(d1),
+                                        "lsb_ps": float(lsb),
+                                    }
+
+                    self.after(0, _update_cache)
+                except Exception:
+                    pass
+                self.after(0, lambda: self._set_status(f"Calib DCO completed → {path}"))
 
             threading.Thread(target=work, daemon=True).start()
 
@@ -1152,10 +1279,10 @@ class Ignite64Gui(tk.Tk):
             win.destroy()
 
         bf = ttk.Frame(frm)
-        bf.grid(row=12, column=0, columnspan=2, pady=(12, 0))
+        bf.grid(row=br + 12, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(bf, text="Start", command=do_ok).pack(side="left", padx=(0, 8))
         ttk.Button(bf, text="Cancel", command=do_cancel).pack(side="left")
-        ttk.Label(frm, textvariable=err_var, foreground="#b00020").grid(row=11, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, textvariable=err_var, foreground="#b00020").grid(row=br + 11, column=0, columnspan=2, sticky="w")
 
         frm.grid_columnconfigure(1, weight=1)
 
@@ -1172,6 +1299,136 @@ class Ignite64Gui(tk.Tk):
             return None
         finally:
             self.update_idletasks()
+
+    def _open_dco_cal_map(self) -> None:
+        """
+        Mappa calibrazione DCO come nel C#: griglia 4×4 di mattonelle (16 MAT),
+        ciascuna 8×8 pixel con valore LSB (ps) e colore per qualità LSB.
+        Dati da lookup `self._dco_calib_cache` (popolata dopo "Calib DCO…").
+        """
+        win = tk.Toplevel(self)
+        win.title("DCO calibration map — 16 MAT")
+        win.transient(self)
+        win.resizable(True, True)
+        try:
+            win.lift(self)
+            win.focus_force()
+            win.attributes("-topmost", True)
+            win.after(150, lambda: win.attributes("-topmost", False))
+        except Exception:
+            try:
+                win.lift()
+            except Exception:
+                pass
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill="both", expand=True)
+
+        q_var = tk.StringVar(value=str(self.quad_var.get()).strip().upper())
+
+        top = ttk.Frame(root)
+        top.pack(fill="x")
+        ttk.Label(top, text="Quadrant:").pack(side="left")
+        q_cb = ttk.Combobox(top, state="readonly", width=5, values=("SW", "NW", "SE", "NE"), textvariable=q_var)
+        q_cb.pack(side="left", padx=(6, 12))
+
+        stats_var = tk.StringVar(value="—")
+        ttk.Label(root, textvariable=stats_var, wraplength=820).pack(anchor="w", pady=(6, 6))
+
+        small_cell = 18
+        gap_mat = 6
+        block_px = 8 * small_cell
+        pad = 10
+        n_side = 4
+        canvas_w = 2 * pad + n_side * block_px + (n_side - 1) * gap_mat
+        canvas_h = canvas_w
+
+        canvas = tk.Canvas(root, width=canvas_w, height=canvas_h, highlightthickness=0, bg="#f4f4f4")
+        canvas.pack()
+
+        def _cell_color(lsb_ps: float) -> str:
+            if lsb_ps <= 0:
+                return "#e8e8e8"
+            if 26.0 <= lsb_ps <= 34.0:
+                return "#b7e1cd"
+            if 22.0 <= lsb_ps <= 40.0:
+                return "#fff2cc"
+            return "#f4c7c3"
+
+        def _render() -> None:
+            canvas.delete("all")
+            q = str(q_var.get()).strip().upper()
+            tot_cal = 0
+            for mat in range(16):
+                mr, mc = mat // 4, mat % 4
+                ox = pad + mc * (block_px + gap_mat)
+                oy = pad + mr * (block_px + gap_mat)
+                canvas.create_rectangle(
+                    ox - 1, oy - 1, ox + block_px + 1, oy + block_px + 1, outline="#777777", width=1
+                )
+                canvas.create_text(
+                    ox + block_px - 4,
+                    oy + 6,
+                    text=str(mat),
+                    anchor="ne",
+                    font=("Segoe UI", 9, "bold"),
+                    fill="#222222",
+                )
+
+                for pix in range(64):
+                    pr, pc = pix // 8, pix % 8
+                    d = self._dco_calib_cache.get((q, mat, pix))
+                    lsb = float(d.get("lsb_ps", 0.0)) if isinstance(d, dict) else 0.0
+                    if lsb > 0.0:
+                        tot_cal += 1
+                    x0 = ox + pc * small_cell
+                    y0 = oy + pr * small_cell
+                    x1 = x0 + small_cell - 1
+                    y1 = y0 + small_cell - 1
+                    canvas.create_rectangle(x0, y0, x1, y1, fill=_cell_color(lsb), outline="#bbbbbb", width=1)
+                    if lsb > 0.0:
+                        canvas.create_text(
+                            (x0 + x1) / 2,
+                            (y0 + y1) / 2,
+                            text=f"{lsb:.0f}",
+                            font=("Segoe UI", 7),
+                        )
+
+            stats_var.set(
+                f"Q={q}: calibrated pixels {tot_cal}/1024 (16×64). "
+                f"Color: green ≈26–34 ps (target ~30), yellow 22–40 ps, red otherwise; gray = not calibrated. "
+                f"Click a pixel to open the FTDAC popup (MAT 4–7: only if enabled)."
+            )
+
+        def _on_click(ev: tk.Event) -> None:
+            x = int(ev.x) - pad
+            y = int(ev.y) - pad
+            block = block_px + gap_mat
+            if x < 0 or y < 0:
+                return
+            mc = x // block
+            xr = x - mc * block
+            mr = y // block
+            yr = y - mr * block
+            if mc < 0 or mc > 3 or mr < 0 or mr > 3:
+                return
+            if xr >= block_px or yr >= block_px:
+                return
+            mat = mr * 4 + mc
+            pc = int(xr // small_cell)
+            pr = int(yr // small_cell)
+            if pc < 0 or pc > 7 or pr < 0 or pr > 7:
+                return
+            pix = pr * 8 + pc
+            try:
+                self.quad_var.set(str(q_var.get()).strip().upper())
+            except Exception:
+                pass
+            self._open_ftdac_popup(mat, pix)
+
+        canvas.bind("<Button-1>", _on_click)
+        q_cb.bind("<<ComboboxSelected>>", lambda _e: _render())
+        _render()
 
     def _capture_mat_snapshot(self, quad: str) -> int:
         """
@@ -1299,6 +1556,69 @@ class Ignite64Gui(tk.Tk):
             "fifo_full": fifo_full,
             "fifo_halffull": fifo_halffull,
         }
+
+    def _fifo_decode_word_tdc(self, w: int, *, quad: str) -> dict[str, object]:
+        """
+        Extended FIFO decode for DCO/TDC calibration / measurement words (C# compatible fields),
+        with optional TA/TOT computation when DCO periods are known.
+        """
+        base = self._fifo_decode_word(int(w))
+        fields = raw_fifo_to_fields(int(w))
+        mat = int(fields.get("mat", base.get("mat", 0)))  # type: ignore[arg-type]
+        pix = int(fields.get("pix", base.get("channel", 0)))  # type: ignore[arg-type]
+        cal_mode = int(fields.get("cal_mode", 0))  # type: ignore[arg-type]
+
+        def _as_int(x: object) -> Optional[int]:
+            try:
+                if x is None or x == "-":
+                    return None
+                return int(x)  # type: ignore[arg-type]
+            except Exception:
+                return None
+
+        dco = _as_int(fields.get("dco_field"))
+        de = _as_int(fields.get("de_field"))
+        cal_time = _as_int(fields.get("cal_time_field"))
+        cnt_tot = _as_int(fields.get("cnt_tot"))
+        counts_0 = _as_int(fields.get("counts_0"))
+        counts_1 = _as_int(fields.get("counts_1"))
+
+        out: dict[str, object] = {
+            **base,
+            "pix": pix,
+            "cal_mode": cal_mode,
+            "dco": dco,
+            "de": de,
+            "cal_time": cal_time,
+            "cnt_tot": cnt_tot,
+            "counts_0": counts_0,
+            "counts_1": counts_1,
+        }
+
+        # If calibration periods are known for this (quad, mat, pix), compute TA/TOT like C#.
+        k = (str(quad).strip().upper(), int(mat), int(pix))
+        calib = self._dco_calib_cache.get(k)
+        if isinstance(calib, dict):
+            try:
+                dco0_ps = float(calib.get("dco0_ps", 0.0))
+                dco1_ps = float(calib.get("dco1_ps", 0.0))
+            except Exception:
+                dco0_ps, dco1_ps = 0.0, 0.0
+            if dco0_ps > 0.0 and dco1_ps > 0.0:
+                out["dco0_ps"] = dco0_ps
+                out["dco1_ps"] = dco1_ps
+                out["lsb_ps"] = float(dco0_ps) - float(dco1_ps)
+                # TA/TOT are meaningful for measurement words (CAL_Mode == 0) where counts_0/1 exist.
+                if cal_mode == 0 and counts_0 is not None and counts_1 is not None and cnt_tot is not None:
+                    try:
+                        ta_ps = (float(int(counts_0) - 1) * dco0_ps) - (float(int(counts_1) - 2) * dco1_ps)
+                        tot_ps = float(int(cnt_tot) - 1) * dco0_ps
+                        out["ta_ps"] = ta_ps
+                        out["tot_ps"] = tot_ps
+                    except Exception:
+                        pass
+
+        return out
 
     def _fifo_ensure_i2c(self) -> None:
         # FIFO readout over I2C requires TOP readout interface set to i2c.
@@ -1610,6 +1930,24 @@ class Ignite64Gui(tk.Tk):
                 fn()
             except Exception:
                 pass
+        self._refresh_home_quad_monitor_texts()
+
+    def _refresh_home_quad_monitor_texts(self) -> None:
+        d = getattr(self, "_home_quad_mon_texts", None)
+        if not isinstance(d, dict):
+            return
+        for q in ("NW", "NE", "SW", "SE"):
+            tx = d.get(q)
+            if tx is None:
+                continue
+            body = (self._quad_monitor_canvas.get(q) or "").strip()
+            try:
+                tx.configure(state="normal")
+                tx.delete("1.0", "end")
+                tx.insert("end", body if body else "—")
+                tx.configure(state="disabled")
+            except tk.TclError:
+                pass
 
     def _gather_quad_stats(self, quad: str) -> dict[str, int]:
         """Per-quadrant counts (full MAT×pixel scan — runs in a worker thread)."""
@@ -1637,7 +1975,8 @@ class Ignite64Gui(tk.Tk):
         power_ok: Optional[bool],
         power_err: Optional[str],
     ) -> str:
-        """Testo completo per un quadrante: analog %, PIX %, TDC %, power (globale + placeholder mW)."""
+        """Testo per un quadrante: canali, PIX, TDC (Analog Power globale: solo bottone in home)."""
+        _ = (power_ok, power_err)  # API invariata; stato power non duplicato qui
         n_pix = 1024
         n_mat = 16
         a = int(st.get("analog_on", 0))
@@ -1646,33 +1985,25 @@ class Ignite64Gui(tk.Tk):
         pa = round(100.0 * a / n_pix, 1)
         pd = round(100.0 * d / n_pix, 1)
         pt = round(100.0 * t / n_mat, 1)
-        if power_err:
-            ap = f"err: {power_err[:44]}"
-        elif power_ok is None:
-            ap = "n/d"
-        else:
-            ap = "ON" if power_ok else "OFF"
         lines = [
-            f"{quad}",
+            f"{quad} — channels on: Analog CH ON = {a}/{n_pix}  ·  Dig PIX ON = {d}/{n_pix}",
             f"Analog Channel ON: {a} / {n_pix} ({pa}%)",
             f"Dig PIX ON: {d} / {n_pix} ({pd}%)",
             f"TDCon: {t} / {n_mat} MAT ({pt}%)",
-            f"Analog Power (globale IOext): {ap}",
-            "Power consumption: — mW (per-quadrante: n/d in API)",
-            "Analog ch. calibrated: — (n/d)",
+            "Power consumption: — mW (per-quadrant: n/a in API)",
+            "Analog ch. calibrated: — (n/a)",
         ]
         return "\n".join(lines)
 
     def _placeholder_quad_monitor_block(self, quad: str, *, offline: bool) -> str:
         tag = "OFFLINE" if offline else "…"
         lines = [
-            quad,
+            f"{quad} — channels on: {tag}",
             f"Analog Channel ON: {tag}",
             f"Dig PIX ON: {tag}",
             f"TDCon: {tag}",
-            f"Analog Power (globale IOext): {tag}",
-            "Power consumption: — mW (per-quadrante: n/d in API)",
-            "Analog ch. calibrated: — (n/d)",
+            "Power consumption: — mW (per-quadrant: n/a in API)",
+            "Analog ch. calibrated: — (n/a)",
         ]
         return "\n".join(lines)
 
@@ -1801,7 +2132,7 @@ class Ignite64Gui(tk.Tk):
         self._run_quadrants_top_mon_async(seq)
 
     def _run_quadrants_top_mon_async(self, seq: int) -> None:
-        """Lettura TOP (mux = quadrante menu in alto) per il monitor sulla pagina Quadrants."""
+        """Lettura TOP (mux = quadrante corrente) per il monitor sulla home."""
 
         def work() -> None:
             if self.offline:
@@ -1809,7 +2140,7 @@ class Ignite64Gui(tk.Tk):
                 def apply_off() -> None:
                     if seq != self._quadrants_top_mon_seq:
                         return
-                    self._quadrants_top_mon_var.set("TOP (lettura): OFFLINE — connettere hardware.")
+                    self._quadrants_top_mon_var.set("TOP (read): OFFLINE — connect hardware.")
 
                 self.after(0, apply_off)
                 return
@@ -1829,7 +2160,7 @@ class Ignite64Gui(tk.Tk):
                     f"StartTP={st_on}  repet={rep}"
                 )
             except Exception as e:
-                line = f"TOP (lettura): {str(e)[:180]}"
+                line = f"TOP (read): {str(e)[:180]}"
 
             def apply() -> None:
                 if seq != self._quadrants_top_mon_seq:
@@ -1854,7 +2185,7 @@ class Ignite64Gui(tk.Tk):
         frm.bind("<Destroy>", on_destroy, add="+")
 
         if self.offline:
-            self._quadrants_top_mon_var.set("TOP (lettura): OFFLINE — connettere hardware.")
+            self._quadrants_top_mon_var.set("TOP (read): OFFLINE — connect hardware.")
             return
 
         def tick() -> None:
@@ -1926,12 +2257,12 @@ class Ignite64Gui(tk.Tk):
             f"GPO SLVS: {sn.get('slvs', '—')}",
             f"FE polarity: {sn.get('fe_polarity', '—')}",
             "",
-            "Segnale TP (TOP reg 11 — StartTP / repet / EOS):",
+            "TP signal (TOP reg 11 — StartTP / repet / EOS):",
             f"  Start TP: {st_on}",
             f"  Repetition (LSB): {tp.get('repetition', '—')}",
             f"  EOS (bit7): {tp.get('eos', '—')}",
             "",
-            "Raw TOP byte (AFE pulse — tp_width / start_tp verso firmware / README):",
+            "Raw TOP byte (AFE pulse — tp_width / start_tp, see firmware / README):",
             reg_line("TOP[9]", r9),
             reg_line("TOP[10]", r10),
             reg_line("TOP[11]", r11),
@@ -1951,7 +2282,7 @@ class Ignite64Gui(tk.Tk):
             return
         if self.offline:
             for q, txt in texts.items():
-                self._top_snapshot_set_text(txt, f"Quadrant {q}\n\nOFFLINE — nessuna lettura HW.")
+                self._top_snapshot_set_text(txt, f"Quadrant {q}\n\nOFFLINE — no HW read.")
             return
 
         def work() -> None:
@@ -1995,8 +2326,8 @@ class Ignite64Gui(tk.Tk):
             lf.grid(row=rr, column=cc, sticky="nsew", padx=6, pady=6)
             t = tk.Text(
                 lf,
-                height=14,
-                width=38,
+                height=18,
+                width=44,
                 font=("Segoe UI", 11),
                 wrap="word",
                 relief="flat",
@@ -2016,10 +2347,10 @@ class Ignite64Gui(tk.Tk):
         frm = ttk.Frame(parent)
         head = ttk.Frame(frm)
         head.pack(fill="x", pady=(0, 6))
-        ttk.Label(head, text="TOP — tutti i quadranti", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(head, text="TOP — all quadrants", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             head,
-            text="In alto: impostazioni e scrittura registri TOP. Sotto: lettura dettagliata per NW/NE/SW/SE.",
+            text="Above: TOP register write controls. Below: detailed readout for NW/NE/SW/SE.",
             font=("Segoe UI", 10),
             foreground="#424242",
         ).pack(anchor="w", pady=(4, 0))
@@ -2027,12 +2358,12 @@ class Ignite64Gui(tk.Tk):
         # Striscia scrittura PRIMA della griglia: altrimenti expand sulla griglia spinge i comandi sotto il bordo finestra.
         self._build_top_controls_strip(frm).pack(fill="x", pady=(10, 0))
 
-        ttk.Label(frm, text="Lettura registri TOP (per quadrante)", font=("Segoe UI", 11, "bold")).pack(
+        ttk.Label(frm, text="TOP register readout (per quadrant)", font=("Segoe UI", 11, "bold")).pack(
             anchor="w", pady=(14, 4)
         )
         bar = ttk.Frame(frm)
         bar.pack(fill="x", pady=(0, 6))
-        ttk.Button(bar, text="Aggiorna lettura", command=self._schedule_top_snapshot_refresh).pack(side="left")
+        ttk.Button(bar, text="Refresh readout", command=self._schedule_top_snapshot_refresh).pack(side="left")
 
         body = ttk.Frame(frm)
         body.pack(fill="both", expand=True, pady=(4, 0))
@@ -2059,14 +2390,14 @@ class Ignite64Gui(tk.Tk):
         self._ensure_top_control_vars()
         lf = ttk.Labelframe(
             parent,
-            text="TOP — scrittura (mux); in Quadrants il riepilogo lettura segue il quadrante nel menu",
+            text="TOP — write (mux); home summary follows current quadrant (navigation)",
             padding=8,
         )
         g = ttk.Frame(lf)
         g.pack(fill="x")
 
         r = 0
-        ttk.Label(g, text="Quadrante (scrittura / readback)").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Label(g, text="Quadrant (write / readback)").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
         ttk.Combobox(
             g,
             textvariable=self._top_apply_quad_var,
@@ -2086,12 +2417,12 @@ class Ignite64Gui(tk.Tk):
             try:
                 self._before_top_write()
                 self.hw.TopDriverSTR(int(self._top_drv_var.get()))
-                self._set_status(f"TOP Driver STR applicato → {self._sel_top_apply_quad()}")
+                self._set_status(f"TOP Driver STR applied → {self._sel_top_apply_quad()}")
                 refresh_top_ro()
             except Exception as e:
                 self._set_status(str(e))
 
-        ttk.Button(g, text="Applica", command=apply_drv).grid(row=r, column=2, padx=8, pady=2)
+        ttk.Button(g, text="Apply", command=apply_drv).grid(row=r, column=2, padx=8, pady=2)
         r += 1
 
         ttk.Label(g, text="Readout").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
@@ -2104,12 +2435,12 @@ class Ignite64Gui(tk.Tk):
             try:
                 self._before_top_write()
                 self.hw.TopReadout(self._top_ro_var.get())
-                self._set_status(f"Readout → {self._top_ro_var.get()} ({self._sel_top_apply_quad()})")
+                self._set_status(f"Readout set → {self._top_ro_var.get()} ({self._sel_top_apply_quad()})")
                 refresh_top_ro()
             except Exception as e:
                 self._set_status(str(e))
 
-        ttk.Button(g, text="Applica readout", command=apply_ro).grid(row=r, column=3, padx=8, pady=2)
+        ttk.Button(g, text="Apply readout", command=apply_ro).grid(row=r, column=3, padx=8, pady=2)
         r += 1
 
         ttk.Label(g, text="GPO SLVS").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
@@ -2122,12 +2453,12 @@ class Ignite64Gui(tk.Tk):
             try:
                 self._before_top_write()
                 self.hw.TopSLVS(self._top_slvs_var.get())
-                self._set_status(f"SLVS → {self._top_slvs_var.get()} ({self._sel_top_apply_quad()})")
+                self._set_status(f"SLVS set → {self._top_slvs_var.get()} ({self._sel_top_apply_quad()})")
                 refresh_top_ro()
             except Exception as e:
                 self._set_status(str(e))
 
-        ttk.Button(g, text="Applica SLVS", command=apply_slvs).grid(row=r, column=3, padx=8, pady=2)
+        ttk.Button(g, text="Apply SLVS", command=apply_slvs).grid(row=r, column=3, padx=8, pady=2)
         r += 1
 
         ttk.Label(g, text="TP repet (0–63)").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
@@ -2149,7 +2480,7 @@ class Ignite64Gui(tk.Tk):
 
         def refresh_top_ro() -> None:
             if self.offline:
-                self._top_status_var.set("OFFLINE — controlli TOP disabilitati")
+                self._top_status_var.set("OFFLINE — TOP controls disabled")
                 return
             try:
                 self._before_top_write()
@@ -2163,12 +2494,12 @@ class Ignite64Gui(tk.Tk):
                 self._top_status_var.set(
                     f"TOP [{qq}]: readout={self._top_ro_var.get()}  SLVS={self._top_slvs_var.get()}  "
                     f"StartTP={tp['start']} repet={tp['repetition']}  "
-                    f"(registri completi nei pannelli NW/NE/SW/SE sopra)"
+                    f"(full registers in NW/NE/SW/SE panels above)"
                 )
             except Exception as e:
                 self._top_status_var.set(str(e)[:200])
 
-        ttk.Button(g, text="Leggi TOP", command=refresh_top_ro).grid(row=r, column=3, padx=8, pady=2)
+        ttk.Button(g, text="Read TOP", command=refresh_top_ro).grid(row=r, column=3, padx=8, pady=2)
         r += 1
 
         ttk.Label(g, textvariable=self._top_status_var, wraplength=920, font=("Segoe UI", 10)).grid(
@@ -2187,19 +2518,51 @@ class Ignite64Gui(tk.Tk):
     # -----
     def _build_quadrants_view(self, parent: ttk.Frame) -> ttk.Frame:
         frm = ttk.Frame(parent)
-        ttk.Label(frm, text="Quadrants", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 10))
+
+        def _on_qhome_destroy(ev: tk.Event) -> None:
+            if ev.widget is frm:
+                self._die_canvas_redraw = None
+
+        frm.bind("<Destroy>", _on_qhome_destroy, add="+")
+
+        hdr = ttk.Frame(frm)
+        hdr.pack(fill="x", pady=(0, 10))
+        ttk.Label(hdr, text="IGNITE64 ASIC", font=("Segoe UI", 16, "bold")).pack(side="left", anchor="w")
+        Image_b, _ImageTk_b = _maybe_load_pil()
+        bim, _bwhy = self._load_banner_pil(Image_b)
+        if bim is not None and Image_b is not None and _ImageTk_b is not None:
+            try:
+                w0, h0 = bim.size
+                target_h = 52
+                nw = max(1, int(w0 * (target_h / float(h0))))
+                rs = _pil_resample_lanczos(Image_b)
+                im2 = bim.resize((nw, target_h), rs)
+                ph = _ImageTk_b.PhotoImage(im2.convert("RGBA"))
+                self._banner_photo_ref = ph
+                tk.Label(hdr, image=ph, bg=self._window_bg, cursor="").pack(side="right", padx=(12, 0))
+            except Exception:
+                self._banner_photo_ref = None
 
         top_mon = ttk.Labelframe(
             frm,
-            text="TOP — valori attuali (lettura sul quadrante selezionato nel menu «Quadrant» sopra)",
+            text="TOP — status & reads (mux follows current quadrant / navigation)",
             padding=8,
         )
-        top_mon.pack(fill="x", pady=(0, 10))
+        top_mon.pack(fill="x", pady=(0, 6))
+        top_mon_btn = ttk.Frame(top_mon)
+        top_mon_btn.pack(fill="x", pady=(0, 8))
+        ttk.Button(top_mon_btn, text="Open TOP page…", command=self._open_top_view).pack(side="left")
+        ttk.Label(
+            top_mon_btn,
+            text="Driver, readout, SLVS, StartTP, …",
+            font=("Segoe UI", 9),
+            foreground="#666666",
+        ).pack(side="left", padx=(10, 0))
         ttk.Label(
             top_mon,
             textvariable=self._quadrants_top_mon_var,
             font=("Segoe UI", 10),
-            wraplength=1050,
+            wraplength=1280,
             justify="left",
         ).pack(anchor="w")
 
@@ -2247,242 +2610,526 @@ class Ignite64Gui(tk.Tk):
         self._analog_power_btn.pack(anchor="w", pady=(0, 10))
 
         ttk.Label(
-            top_mon,
-            text="Per modificare driver / readout / SLVS / TP apri la pagina TOP cliccando la fascia TOP (blu) sul die.",
+            frm,
+            text="Die photo (or placeholder grid if JPEG missing): click a quadrant for FIFO / calib. TOP: button above. Per-quadrant monitors on the sides. Analog Power: button below.",
             font=("Segoe UI", 9),
             foreground="#555555",
-        ).pack(anchor="w", pady=(6, 0))
+        ).pack(anchor="w", pady=(0, 4))
 
         win_bg = getattr(self, "_window_bg", "#f0f0f0")
-        Image, ImageTk = _maybe_load_pil()
-        die_im, die_info = self._load_die_photo_pil(Image)
+        Image_pil, ImageTk_mod = _maybe_load_pil()
+        die_im, _die_meta = self._load_die_photo_pil(Image_pil)
+        use_die = die_im is not None and Image_pil is not None and ImageTk_mod is not None
 
-        use_die = die_im is not None and Image is not None and ImageTk is not None
-        if die_im is not None and Image is not None and ImageTk is None:
-            del die_info  # foto presente ma senza ImageTk — uso griglia fallback
+        die_host = ttk.Frame(frm)
+        die_host.pack(fill="both", expand=True, pady=(0, 6))
+
+        die_grid = ttk.Frame(die_host)
+        die_grid.pack(fill="both", expand=True)
+        # Side columns: quadrant monitors. Center column: die photo — uses full height between rows.
+        die_grid.columnconfigure(0, weight=1, minsize=180)
+        die_grid.columnconfigure(1, weight=8, minsize=420)
+        die_grid.columnconfigure(2, weight=1, minsize=180)
+        die_grid.rowconfigure(0, weight=1)
+        die_grid.rowconfigure(1, weight=1)
+
+        self._home_quad_mon_texts = {}
+
+        def _add_home_quad_mon_cell(row: int, col: int, q: str, sticky: str) -> None:
+            cell = tk.Frame(die_grid, bg=self._window_bg, highlightbackground="#90a4ae", highlightthickness=1)
+            cell.grid(row=row, column=col, sticky=sticky, padx=4, pady=4)
+            tk.Label(
+                cell,
+                text=f" {q} ",
+                font=("Segoe UI", 10, "bold"),
+                fg="#b71c1c",
+                bg=self._window_bg,
+            ).pack(anchor="w", padx=4, pady=(2, 0))
+            tx = tk.Text(
+                cell,
+                height=18,
+                width=48,
+                wrap="word",
+                font=("Consolas", 10),
+                bg="#fafafa",
+                relief="flat",
+                highlightthickness=0,
+                padx=4,
+                pady=2,
+            )
+            tx.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+            tx.configure(state="disabled")
+            self._home_quad_mon_texts[q] = tx
+
+        _add_home_quad_mon_cell(0, 0, "NW", "nsew")
+        _add_home_quad_mon_cell(1, 0, "SW", "nsew")
+        canvas_host = tk.Frame(die_grid, bg=win_bg)
+        canvas_host.grid(row=0, column=1, rowspan=2, sticky="nsew", pady=4, padx=(8, 8))
+        _add_home_quad_mon_cell(0, 2, "NE", "nsew")
+        _add_home_quad_mon_cell(1, 2, "SE", "nsew")
 
         if use_die:
-            chip_box = _parse_die_chip_box()
-            bl, bt, br, bb = chip_box
-            chip_outer = tk.Frame(frm, bg=win_bg)
-            chip_outer.pack(fill="both", expand=True)
-
-            cv = tk.Canvas(chip_outer, highlightthickness=0, bd=0, bg=win_bg)
-            cv.pack(fill="both", expand=True)
-
             iw, ih = die_im.size
+            cv_die = tk.Canvas(canvas_host, highlightthickness=0, bd=0, bg=win_bg)
+            cv_die.pack(fill="both", expand=True)
 
             def redraw_die(_ev=None) -> None:
-                cv.delete("all")
-                cw = int(cv.winfo_width())
-                ch = int(cv.winfo_height())
+                cv_die.delete("all")
+                cw = int(cv_die.winfo_width())
+                ch = int(cv_die.winfo_height())
                 if cw < 8 or ch < 8:
                     return
                 nw, nh, x_off, y_off = _die_contain_geom(iw, ih, cw, ch)
-                rs = _pil_resample_lanczos(Image)
+                rs = _pil_resample_lanczos(Image_pil)
                 im2 = die_im.resize((nw, nh), rs)
-                ph = ImageTk.PhotoImage(im2.convert("RGBA"))
-                cv._die_photo_ref = ph  # type: ignore[attr-defined]
-                cv.create_image(x_off, y_off, image=ph, anchor="nw", tags=("die_bg",))
+                ph = ImageTk_mod.PhotoImage(im2.convert("RGBA"))
+                cv_die._die_photo_ref = ph  # type: ignore[attr-defined]
+                cv_die.create_image(x_off, y_off, image=ph, anchor="nw", tags=("die_bg",))
 
-                bx0 = bl * nw + x_off
-                by0 = bt * nh + y_off
-                bx1 = br * nw + x_off
-                by1 = bb * nh + y_off
-                mu = (bl + br) * 0.5 * nw + x_off
-                mv = (bt + bb) * 0.5 * nh + y_off
+                # Quadrato rosso = intera immagine chip (bitmap ridimensionata), non solo IGNITE_DIE_CHIP_BOX.
+                bx0 = float(x_off)
+                by0 = float(y_off)
+                bx1 = float(x_off + nw)
+                by1 = float(y_off + nh)
+                mu = (bx0 + bx1) * 0.5
+                mv = (by0 + by1) * 0.5
 
-                cv.create_rectangle(bx0, by0, bx1, by1, outline="#b71c1c", width=3, tags=("die_overlay",))
-                cv.create_line(mu, by0, mu, by1, fill="#4e342e", width=2, tags=("die_overlay",))
-                cv.create_line(bx0, mv, bx1, mv, fill="#4e342e", width=2, tags=("die_overlay",))
+                cv_die.create_rectangle(bx0, by0, bx1, by1, outline="#b71c1c", width=3, tags=("die_overlay",))
+                cv_die.create_line(mu, by0, mu, by1, fill="#4e342e", width=2, tags=("die_overlay",))
+                cv_die.create_line(bx0, mv, bx1, mv, fill="#4e342e", width=2, tags=("die_overlay",))
 
-                hh_px = max(1.0, (bb - bt) * nh)
+                hh_px = max(1.0, float(nh))
                 fz = max(14, min(96, int(hh_px * 0.12)))
 
-                mu_n = (bl + br) * 0.5
-                mv_n = (bt + bb) * 0.5
                 centers = {
-                    "NW": ((bl + mu_n) * 0.5, (bt + mv_n) * 0.5),
-                    "NE": ((mu_n + br) * 0.5, (bt + mv_n) * 0.5),
-                    "SW": ((bl + mu_n) * 0.5, (mv_n + bb) * 0.5),
-                    "SE": ((mu_n + br) * 0.5, (mv_n + bb) * 0.5),
+                    "NW": ((bx0 + mu) * 0.5, (by0 + mv) * 0.5),
+                    "NE": ((mu + bx1) * 0.5, (by0 + mv) * 0.5),
+                    "SW": ((bx0 + mu) * 0.5, (mv + by1) * 0.5),
+                    "SE": ((mu + bx1) * 0.5, (mv + by1) * 0.5),
                 }
-                for qn, (un, vn) in centers.items():
-                    cx = un * nw + x_off
-                    cy = vn * nh + y_off
-                    _draw_quad_label(cv, cx, cy, qn, fz)
-
-                # Guida visiva zona TOP (rettangolo blu tratteggiato sulla foto — regola con IGNITE_DIE_TOP_BAND).
-                tl, tt, tr, tb = _parse_die_top_band()
-                tx0 = tl * nw + x_off
-                ty0 = tt * nh + y_off
-                tx1 = tr * nw + x_off
-                ty1 = tb * nh + y_off
-                cv.create_rectangle(tx0, ty0, tx1, ty1, outline="#1565c0", width=2, dash=(6, 4), tags=("die_top_band",))
-                cv.create_text(
-                    (tx0 + tx1) / 2,
-                    (ty0 + ty1) / 2,
-                    text="TOP",
-                    fill="#1565c0",
-                    font=("Segoe UI", fz, "bold"),
-                    justify="center",
-                    tags=("die_top_band",),
-                )
-
-                # Monitoring: un blocco per quadrante solo nelle bande grigie (fuori dalla foto / bitmap).
-                _draw_quadrant_monitor_panels_outside(
-                    cv,
-                    canvas_w=cw,
-                    canvas_h=ch,
-                    inner_left=float(x_off),
-                    inner_top=float(y_off),
-                    inner_right=float(x_off + nw),
-                    inner_bottom=float(y_off + nh),
-                    qtxt=self._quad_monitor_canvas,
-                )
+                for qn, (cx, cy) in centers.items():
+                    _draw_quad_label(cv_die, cx, cy, qn, fz)
 
             def on_die_click(ev: tk.Event) -> None:
-                cw = int(cv.winfo_width())
-                ch = int(cv.winfo_height())
-                if cw < 4 or ch < 4:
+                cw2 = int(cv_die.winfo_width())
+                ch2 = int(cv_die.winfo_height())
+                if cw2 < 4 or ch2 < 4:
                     return
-                nw, nh, x_off, y_off = _die_contain_geom(iw, ih, cw, ch)
-                u, v = _canvas_to_norm_uv_contain(float(ev.x), float(ev.y), nw, nh, x_off, y_off)
+                nw2, nh2, x_off2, y_off2 = _die_contain_geom(iw, ih, cw2, ch2)
+                u, v = _canvas_to_norm_uv_contain(float(ev.x), float(ev.y), nw2, nh2, x_off2, y_off2)
                 if not (-1e-6 <= u <= 1.0 + 1e-6 and -1e-6 <= v <= 1.0 + 1e-6):
                     return
                 u = max(0.0, min(1.0, u))
                 v = max(0.0, min(1.0, v))
-                tl, tt, tr, tb = _parse_die_top_band()
-                if tl <= u <= tr and tt <= v <= tb:
-                    self._open_top_view()
-                    return
-                qq = _quad_from_uv_in_chip_box(u, v, chip_box)
+                _full = (0.0, 0.0, 1.0, 1.0)
+                qq = _quad_from_uv_in_chip_box(u, v, _full)
                 if qq:
                     self._open_quadrant(qq)
 
-            cv.bind("<Configure>", redraw_die)
-            cv.bind("<Button-1>", on_die_click)
-            cv.configure(cursor="hand2")
-
+            cv_die.bind("<Configure>", redraw_die)
+            cv_die.bind("<Button-1>", on_die_click)
+            cv_die.configure(cursor="hand2")
             self._die_canvas_redraw = redraw_die
-            if self.offline:
-                self._apply_monitor_panels_offline()
-            else:
-                self._apply_monitor_panels_placeholder()
-
             self.after_idle(redraw_die)
+            hint_chip = "Red box = die image bounds; monitors on the sides. Env: IGNITE_DIE_PHOTO."
+        else:
+            cv_fb = tk.Canvas(canvas_host, highlightthickness=0, bd=0, bg=win_bg)
+            cv_fb.pack(fill="both", expand=True)
 
-            self._schedule_quadrant_monitor_refresh(frm)
-            self._schedule_quadrants_top_monitor(frm)
+            def redraw_plain(_ev=None) -> None:
+                cv_fb.delete("all")
+                cw = int(cv_fb.winfo_width())
+                ch = int(cv_fb.winfo_height())
+                if cw < 24 or ch < 24:
+                    return
+                pad = max(20, min(cw, ch) // 12)
+                avail_w = cw - 2 * pad
+                avail_h = ch - 2 * pad
+                side = min(avail_w, avail_h)
+                side = max(120, side)
+                x0 = (cw - side) // 2
+                y0 = (ch - side) // 2
+                x1 = x0 + side
+                y1 = y0 + side
+                mx = (x0 + x1) / 2
+                my = (y0 + y1) / 2
+                cv_fb.create_rectangle(x0, y0, x1, y1, outline="#b71c1c", width=3, tags=("plain_matrix",))
+                fills = ("#ececef", "#e2e2e8", "#e2e2e8", "#ececef")
+                cv_fb.create_rectangle(x0, y0, mx, my, outline="#757575", width=2, fill=fills[0])
+                cv_fb.create_rectangle(mx, y0, x1, my, outline="#757575", width=2, fill=fills[1])
+                cv_fb.create_rectangle(x0, my, mx, y1, outline="#757575", width=2, fill=fills[2])
+                cv_fb.create_rectangle(mx, my, x1, y1, outline="#757575", width=2, fill=fills[3])
+                cv_fb.create_line(x0, my, x1, my, fill="#555566", width=2)
+                cv_fb.create_line(mx, y0, mx, y1, fill="#555566", width=2)
+                fz_q = max(14, min(72, side // 5))
+                _draw_quad_label(cv_fb, (x0 + mx) / 2, (y0 + my) / 2, "NW", fz_q)
+                _draw_quad_label(cv_fb, (mx + x1) / 2, (y0 + my) / 2, "NE", fz_q)
+                _draw_quad_label(cv_fb, (x0 + mx) / 2, (my + y1) / 2, "SW", fz_q)
+                _draw_quad_label(cv_fb, (mx + x1) / 2, (my + y1) / 2, "SE", fz_q)
+                cv_fb._plain_geom = (x0, y0, x1, y1, mx, my)  # type: ignore[attr-defined]
 
-            hint = (
-                "Clic sul die (quadrante) o sulla fascia TOP (blu) per aprire la pagina TOP (letture + comandi). "
-                "Env: IGNITE_DIE_PHOTO, IGNITE_DIE_CHIP_BOX, IGNITE_DIE_TOP_BAND."
+            def on_plain_click(ev: tk.Event) -> None:
+                g = getattr(cv_fb, "_plain_geom", None)
+                if not g:
+                    return
+                x0, y0, x1, y1, mx, my = g[:6]
+                if not (x0 <= ev.x <= x1 and y0 <= ev.y <= y1):
+                    return
+                west = ev.x < mx
+                north = ev.y < my
+                if north:
+                    qq = "NW" if west else "NE"
+                else:
+                    qq = "SW" if west else "SE"
+                self._open_quadrant(qq)
+
+            cv_fb.bind("<Configure>", redraw_plain)
+            cv_fb.bind("<Button-1>", on_plain_click)
+            cv_fb.configure(cursor="hand2")
+            self._die_canvas_redraw = redraw_plain
+            self.after_idle(redraw_plain)
+            hint_chip = (
+                "No die photo: simple grid + side monitors. Add icboost/assets/ignite64.jpg or set IGNITE_DIE_PHOTO."
             )
-            ttk.Label(frm, text=hint, font=("Segoe UI", 9), foreground="#444444").pack(anchor="w", pady=(8, 0))
-            return frm
 
-        # Fallback: griglia 2×2 + stessi testi monitor per quadrante; TOP si apre dalla fascia blu.
-        chip_outer = tk.Frame(frm, bg=win_bg)
-        chip_outer.pack(fill="both", expand=True)
-
-        cv_fb = tk.Canvas(chip_outer, highlightthickness=0, bd=0, bg=win_bg)
-        cv_fb.pack(fill="both", expand=True)
-
-        def redraw_plain(_ev=None) -> None:
-            cv_fb.delete("all")
-            cw = int(cv_fb.winfo_width())
-            ch = int(cv_fb.winfo_height())
-            if cw < 24 or ch < 24:
-                return
-            pad = max(20, min(cw, ch) // 12)
-            side = min(cw - 2 * pad, ch - 2 * pad)
-            side = max(120, side)
-            x0 = (cw - side) // 2
-            y0 = (ch - side) // 2
-            x1 = x0 + side
-            y1 = y0 + side
-            mx = (x0 + x1) / 2
-            my = (y0 + y1) / 2
-            fills = ("#ececef", "#e2e2e8", "#e2e2e8", "#ececef")
-            cv_fb.create_rectangle(x0, y0, mx, my, outline="#757575", width=2, fill=fills[0])
-            cv_fb.create_rectangle(mx, y0, x1, my, outline="#757575", width=2, fill=fills[1])
-            cv_fb.create_rectangle(x0, my, mx, y1, outline="#757575", width=2, fill=fills[2])
-            cv_fb.create_rectangle(mx, my, x1, y1, outline="#757575", width=2, fill=fills[3])
-            cv_fb.create_line(x0, my, x1, my, fill="#555566", width=2)
-            cv_fb.create_line(mx, y0, mx, y1, fill="#555566", width=2)
-            fz = max(14, min(72, side // 5))
-            _draw_quad_label(cv_fb, (x0 + mx) / 2, (y0 + my) / 2, "NW", fz)
-            _draw_quad_label(cv_fb, (mx + x1) / 2, (y0 + my) / 2, "NE", fz)
-            _draw_quad_label(cv_fb, (x0 + mx) / 2, (my + y1) / 2, "SW", fz)
-            _draw_quad_label(cv_fb, (mx + x1) / 2, (my + y1) / 2, "SE", fz)
-            _draw_quadrant_monitor_panels_outside(
-                cv_fb,
-                canvas_w=cw,
-                canvas_h=ch,
-                inner_left=float(x0),
-                inner_top=float(y0),
-                inner_right=float(x1),
-                inner_bottom=float(y1),
-                qtxt=self._quad_monitor_canvas,
-                tag="quad_mon_plain",
-            )
-            tl, tt, tr, tb = _parse_die_top_band()
-            pxa = x0 + tl * (x1 - x0)
-            pya = y0 + tt * (y1 - y0)
-            pxb = x0 + tr * (x1 - x0)
-            pyb = y0 + tb * (y1 - y0)
-            cv_fb.create_rectangle(pxa, pya, pxb, pyb, outline="#1565c0", width=2, dash=(6, 4), tags=("plain_top_band",))
-            cv_fb.create_text(
-                (pxa + pxb) / 2,
-                (pya + pyb) / 2,
-                text="TOP",
-                fill="#1565c0",
-                font=("Segoe UI", fz, "bold"),
-                justify="center",
-                tags=("plain_top_band",),
-            )
-            cv_fb._plain_geom = (x0, y0, x1, y1, mx, my)  # type: ignore[attr-defined]
-
-        def on_plain_click(ev: tk.Event) -> None:
-            g = getattr(cv_fb, "_plain_geom", None)
-            if not g:
-                return
-            x0, y0, x1, y1, mx, my = g
-            if not (x0 <= ev.x <= x1 and y0 <= ev.y <= y1):
-                return
-            u = (ev.x - x0) / max(1e-6, (x1 - x0))
-            v = (ev.y - y0) / max(1e-6, (y1 - y0))
-            tl, tt, tr, tb = _parse_die_top_band()
-            if tl <= u <= tr and tt <= v <= tb:
-                self._open_top_view()
-                return
-            west = ev.x < mx
-            north = ev.y < my
-            if north:
-                qq = "NW" if west else "NE"
-            else:
-                qq = "SW" if west else "SE"
-            self._open_quadrant(qq)
-
-        cv_fb.bind("<Configure>", redraw_plain)
-        cv_fb.bind("<Button-1>", on_plain_click)
-        cv_fb.configure(cursor="hand2")
-
-        self._die_canvas_redraw = redraw_plain
         if self.offline:
             self._apply_monitor_panels_offline()
         else:
             self._apply_monitor_panels_placeholder()
 
-        self.after_idle(redraw_plain)
-
         self._schedule_quadrant_monitor_refresh(frm)
         self._schedule_quadrants_top_monitor(frm)
 
-        hint_fb = "Senza foto: griglia semplice. Clic fascia TOP (blu) per la pagina TOP, o un quadrante. Env: IGNITE_DIE_PHOTO."
-        ttk.Label(frm, text=hint_fb, font=("Segoe UI", 9), foreground="#444444").pack(anchor="w", pady=(8, 0))
+        ttk.Label(frm, text=hint_chip, font=("Segoe UI", 9), foreground="#444444").pack(anchor="w", pady=(8, 0))
+
+        self.after_idle(self._refresh_home_quad_monitor_texts)
+
         return frm
+
+    def _make_block_diagram(
+        self,
+        parent_: ttk.Frame,
+        block_id: int,
+        *,
+        compact: bool = False,
+        quad_for_hw: Optional[str] = None,
+        home_grid_tile: bool = False,
+        fetch_stagger: Optional[int] = None,
+        click_opens_quadrant: bool = False,
+    ) -> ttk.Frame:
+        mats = self.mapping.mats_in_block(block_id)
+        owner = self.mapping.analog_owner_mat(block_id)
+        kind = self.mapping.block_kind(block_id)
+
+        def _quad_q_read() -> str:
+            if quad_for_hw is not None:
+                return str(quad_for_hw).strip().upper()
+            return str(self.quad_var.get()).strip().upper()
+
+        pad_outer = 1 if home_grid_tile else ((2, 2) if compact else 6)
+        outer = ttk.Frame(parent_, padding=pad_outer)
+        outer.configure(cursor="hand2")
+
+        if home_grid_tile:
+            title = ttk.Label(
+                outer,
+                text=f"B{block_id} · {kind}",
+                font=("Segoe UI", 7, "bold"),
+            )
+        else:
+            title = ttk.Label(
+                outer,
+                text=f"Block {block_id} ({kind})",
+                font=(("Segoe UI", 9, "bold") if compact else ("Segoe UI", 10, "bold")),
+            )
+        title.pack(anchor="w")
+
+        # Stylized diagram: responsive and always drawn inside a centered square.
+        c = tk.Canvas(
+            outer,
+            highlightthickness=1,
+            highlightbackground="#bdbdbd",
+            bg="white",
+        )
+        _cpad = (1, 0) if home_grid_tile else ((2, 0) if compact else (6, 0))
+        c.pack(pady=_cpad, fill="both", expand=True)
+
+        mat_tl, mat_tr, mat_bl, mat_br = mats
+        kind_u = str(kind).upper()
+        an_fill = "#ffe8e8" if "NOLDO" in kind_u else "#e8fff0"
+
+        mat_cache: dict[int, Optional[dict[str, object]]] = {mid: None for mid in mats}
+        _fetch_gen: list[int] = [0]
+        _fetch_after: list[Optional[str]] = [None]
+
+        # Se abbiamo uno snapshot pre-riempito da FILE, usa subito quei valori
+        # per rendere la vista block coerente senza leggere l'intero chip.
+        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+            qkey_seed = _quad_q_read()
+            cached_for_quad_seed = self._mat_snapshot_cache.get(qkey_seed, {})
+            for mid in mats:
+                if int(mid) in cached_for_quad_seed:
+                    mat_cache[mid] = cached_for_quad_seed[int(mid)]
+
+        def redraw_display(_ev=None) -> None:
+            c.delete("all")
+            w = int(c.winfo_width())
+            h = int(c.winfo_height())
+            if w <= 2 or h <= 2:
+                return
+
+            side = min(w, h)
+            ox = int((w - side) / 2)
+            oy = int((h - side) / 2)
+
+            if home_grid_tile:
+                pad = max(2, int(side * 0.018))
+                gap = max(2, int(side * 0.012))
+                an_w = max(12, int(side * 0.058))
+                label_space = max(7, int(side * 0.032))
+            elif compact:
+                pad = max(4, int(side * 0.03))
+                gap = max(4, int(side * 0.022))
+                an_w = max(22, int(side * 0.09))
+                label_space = max(12, int(side * 0.055))
+            else:
+                pad = max(12, int(side * 0.06))
+                gap = max(10, int(side * 0.04))
+                an_w = max(36, int(side * 0.12))
+                label_space = max(18, int(side * 0.07))
+            avail_h = side - label_space
+            mat_w = int((side - 2 * pad - 2 * gap - an_w) / 2)
+            mat_h = int((avail_h - 2 * pad - gap) / 2)
+            an_h = mat_h * 2 + gap
+
+            x0 = ox + pad
+            y0 = oy + pad
+            tl = (x0, y0, x0 + mat_w, y0 + mat_h)
+            bl = (x0, y0 + mat_h + gap, x0 + mat_w, y0 + 2 * mat_h + gap)
+            ax0 = x0 + mat_w + gap
+            an = (ax0, y0, ax0 + an_w, y0 + an_h)
+            rx0 = ax0 + an_w + gap
+            tr = (rx0, y0, rx0 + mat_w, y0 + mat_h)
+            br = (rx0, y0 + mat_h + gap, rx0 + mat_w, y0 + 2 * mat_h + gap)
+
+            _fz = 0.72 if home_grid_tile else 1.0
+            font_an = ("Segoe UI", max(6, int(side * 0.035 * _fz)), "bold")
+            font_owner = ("Segoe UI", max(6, int(side * 0.03 * _fz)))
+            font_mat_lbl = ("Segoe UI", max(5, int(side * 0.028 * _fz)), "bold")
+            font_ft = ("Segoe UI", max(5, int(side * 0.021 * _fz)))
+
+            def draw_mat(rect: tuple[float, float, float, float], mat_id: int) -> None:
+                rx0_, ry0, rx1_, ry1 = rect
+                rw = rx1_ - rx0_
+                rh = ry1 - ry0
+                ft_h = max(11.0, min(rh * 0.22, 28.0))
+                gy1 = ry1 - ft_h
+                outline_col = "#2f2f2f"
+                entry = mat_cache.get(mat_id)
+                if entry is None:
+                    snap = self._mat_snapshot_cache.get(_quad_q_read(), {}).get(int(mat_id))
+                    if isinstance(snap, dict):
+                        entry = snap
+                if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+                    qkey = _quad_q_read()
+                    cached = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
+                    if isinstance(cached, dict):
+                        entry = cached
+                err_t = None
+                if isinstance(entry, dict) and entry.get("_err"):
+                    err_t = str(entry["_err"])
+                    outline_col = "#c62828"
+
+                c.create_rectangle(rx0_, ry0, rx1_, ry1, fill="#fafafa", outline=outline_col, width=2)
+                c.create_text(
+                    (rx0_ + rx1_) / 2,
+                    ry0 + max(7.0, rh * 0.08),
+                    text=f"MAT {mat_id}",
+                    font=font_mat_lbl,
+                    fill="#1f1f1f",
+                )
+
+                ix0 = rx0_ + 2
+                iy0 = ry0 + max(11.0, rh * 0.14)
+                ix1 = rx1_ - 2
+                iy1 = max(iy0 + 4, gy1 - 2)
+                gw = ix1 - ix0
+                gh = iy1 - iy0
+                if gw < 8 or gh < 8:
+                    return
+
+                pix_on: Optional[list[bool]] = None
+                fe_on: Optional[list[bool]] = None
+                ftdac: Optional[list[int]] = None
+                if isinstance(entry, dict) and not entry.get("_err"):
+                    po = entry.get("pix_on")
+                    fo = entry.get("fe_on")
+                    ft = entry.get("ftdac")
+                    if isinstance(po, list) and isinstance(ft, list) and len(po) >= 64 and len(ft) >= 64:
+                        pix_on = [bool(x) for x in po[:64]]
+                        ftdac = [int(x) for x in ft[:64]]
+                        if isinstance(fo, list) and len(fo) >= 64:
+                            fe_on = [bool(x) for x in fo[:64]]
+
+                cell_w = gw / 8.0
+                cell_h = gh / 8.0
+                cg = max(0.4, min(cell_w, cell_h) * 0.06)
+                for row in range(8):
+                    for col in range(8):
+                        ch = row * 8 + col
+                        cx0 = ix0 + col * cell_w + cg
+                        cy0 = iy0 + row * cell_h + cg
+                        cx1 = ix0 + (col + 1) * cell_w - cg
+                        cy1 = iy0 + (row + 1) * cell_h - cg
+                        if pix_on is not None:
+                            # Match block-detail view: green=ON, red=OFF (user expects "spenti" = rosso).
+                            if fe_on is not None and not fe_on[ch]:
+                                fill = "#bdbdbd"
+                            else:
+                                fill = "#2e7d32" if pix_on[ch] else "#aa2222"
+                            ol = "#37474f"
+                        elif self.offline:
+                            fill = "#eeeeee"
+                            ol = "#90a4ae"
+                        else:
+                            fill = "#f5f5f5"
+                            ol = "#b0bec5"
+                        c.create_rectangle(cx0, cy0, cx1, cy1, fill=fill, outline=ol, width=1)
+
+                ft_y = (gy1 + ry1) / 2
+                if err_t:
+                    ft_msg = "MAT read error"
+                    ft_fill = "#b71c1c"
+                elif self.offline:
+                    ft_msg = "OFFLINE"
+                    ft_fill = "#616161"
+                elif ftdac is not None:
+                    nd = sum(1 for x in ftdac if int(x) != 15)
+                    if nd > 0:
+                        ft_msg = "FTDAC calib. DONE!"
+                        ft_fill = "#1565c0"
+                    else:
+                        ft_msg = "FTDAC: all FT=15"
+                        ft_fill = "#757575"
+                else:
+                    ft_msg = "…"
+                    ft_fill = "#9e9e9e"
+
+                c.create_text((rx0_ + rx1_) / 2, ft_y, text=ft_msg, font=font_ft, fill=ft_fill)
+
+            draw_mat(tl, mat_tl)
+            draw_mat(tr, mat_tr)
+            draw_mat(bl, mat_bl)
+            draw_mat(br, mat_br)
+
+            c.create_rectangle(*an, fill=an_fill, outline="#aa0000", width=2)
+            c.create_text(
+                (an[0] + an[2]) / 2,
+                (an[1] + an[3]) / 2,
+                text="ANALOG\nSERVICES",
+                angle=90,
+                font=font_an,
+                fill="#7a0000",
+                justify="center",
+            )
+            c.create_text(
+                ox + side / 2,
+                oy + side - (label_space / 2),
+                text=f"owner MAT {owner}",
+                font=font_owner,
+                fill="#3a3a3a",
+            )
+
+        def schedule_fetch() -> None:
+            if bool(getattr(self, "_snapshot_capture_in_progress", False)):
+                return
+            if (not bool(getattr(self, "_blocks_view_force_hw", False))) and self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+                qkey = _quad_q_read()
+                cached_for_quad = self._mat_snapshot_cache.get(qkey, {})
+                # Skip HW reads if we already have cached MAT data for this block.
+                if all(int(mid) in cached_for_quad for mid in mats):
+                    return
+            if _fetch_after[0] is not None:
+                try:
+                    self.after_cancel(_fetch_after[0])
+                except Exception:
+                    pass
+                _fetch_after[0] = None
+
+            def fire() -> None:
+                _fetch_after[0] = None
+                if self.offline:
+                    return
+                gen = _fetch_gen[0] + 1
+                _fetch_gen[0] = gen
+                quad_q = _quad_q_read()
+
+                def work() -> None:
+                    try:
+                        out: dict[int, dict[str, object]] = {}
+                        for mid in mats:
+                            # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+                            # Never touch them directly here (block 1 is MAT 4..7).
+                            if 4 <= int(mid) <= 7:
+                                continue
+                            out[mid] = self.hw.readMatPixelsAndFTDAC(quad_q, mattonella=mid)
+
+                        def apply_ok() -> None:
+                            if gen != _fetch_gen[0]:
+                                return
+                            qk = _quad_q_read()
+                            qc = self._mat_snapshot_cache.setdefault(qk, {})
+                            for mid in mats:
+                                if mid in out:
+                                    mat_cache[mid] = out[mid]
+                                    try:
+                                        qc[int(mid)] = out[mid]
+                                    except Exception:
+                                        pass
+                            redraw_display()
+
+                        self.after(0, apply_ok)
+                    except Exception as e:
+                        err_s = str(e)
+
+                        def apply_err() -> None:
+                            if gen != _fetch_gen[0]:
+                                return
+                            for mid in mats:
+                                mat_cache[mid] = {"_err": err_s}
+                            redraw_display()
+
+                        self.after(0, apply_err)
+
+                threading.Thread(target=work, daemon=True).start()
+
+            _st = int(fetch_stagger) if fetch_stagger is not None else int(block_id)
+            _delay_ms = 100 + _st * 40
+            _fetch_after[0] = self.after(_delay_ms, fire)
+
+        def on_configure(_ev=None) -> None:
+            redraw_display()
+            schedule_fetch()
+
+        c.bind("<Configure>", on_configure)
+        redraw_display()
+        schedule_fetch()
+
+        # click: Blocks view → block detail; home summary strip → quadrant (FIFO / calib page)
+        def go(_ev=None) -> None:
+            qset = _quad_q_read()
+            self.quad_var.set(qset)
+            if click_opens_quadrant:
+                self._open_quadrant(qset)
+            else:
+                self._open_block(block_id)
+
+        outer.bind("<Button-1>", go)
+        title.bind("<Button-1>", go)
+        c.bind("<Button-1>", go)
+        outer.bind("<Return>", go)
+
+        return outer
 
     def _open_quadrant(self, q: str) -> None:
         self.quad_var.set(str(q).strip().upper())
@@ -2494,7 +3141,7 @@ class Ignite64Gui(tk.Tk):
         ttk.Label(frm, text=f"Quadrant {quad} → Blocks", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(
             frm,
-            text="Navigazione al block di interesse · MAT 8×8 = canali ON (verde) / OFF (grigio) · sotto: stato FTDAC · FIFO →",
+            text="Navigate to a block · MAT 8×8 = channel ON (green) / OFF (gray) · below: FTDAC status · FIFO →",
             font=("Segoe UI", 9),
             foreground="#424242",
         ).pack(anchor="w", pady=(0, 10))
@@ -2667,278 +3314,8 @@ class Ignite64Gui(tk.Tk):
         grid = ttk.Frame(top)
         grid.pack(side="left", fill="both", expand=True)
 
-        def make_block_widget(parent_: ttk.Frame, *, block_id: int) -> ttk.Frame:
-            mats = self.mapping.mats_in_block(block_id)
-            owner = self.mapping.analog_owner_mat(block_id)
-            kind = self.mapping.block_kind(block_id)
-
-            outer = ttk.Frame(parent_, padding=6)
-            outer.configure(cursor="hand2")
-
-            title = ttk.Label(outer, text=f"Block {block_id} ({kind})", font=("Segoe UI", 10, "bold"))
-            title.pack(anchor="w")
-
-            # Stylized diagram: responsive and always drawn inside a centered square.
-            c = tk.Canvas(
-                outer,
-                highlightthickness=1,
-                highlightbackground="#bdbdbd",
-                bg="white",
-            )
-            c.pack(pady=(6, 0), fill="both", expand=True)
-
-            mat_tl, mat_tr, mat_bl, mat_br = mats
-            kind_u = str(kind).upper()
-            an_fill = "#ffe8e8" if "NOLDO" in kind_u else "#e8fff0"
-
-            mat_cache: dict[int, Optional[dict[str, object]]] = {mid: None for mid in mats}
-            _fetch_gen: list[int] = [0]
-            _fetch_after: list[Optional[str]] = [None]
-
-            # Se abbiamo uno snapshot pre-riempito da FILE, usa subito quei valori
-            # per rendere la vista block coerente senza leggere l'intero chip.
-            if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
-                qkey_seed = str(self.quad_var.get()).strip().upper()
-                cached_for_quad_seed = self._mat_snapshot_cache.get(qkey_seed, {})
-                for mid in mats:
-                    if int(mid) in cached_for_quad_seed:
-                        mat_cache[mid] = cached_for_quad_seed[int(mid)]
-
-            def redraw_display(_ev=None) -> None:
-                c.delete("all")
-                w = int(c.winfo_width())
-                h = int(c.winfo_height())
-                if w <= 2 or h <= 2:
-                    return
-
-                side = min(w, h)
-                ox = int((w - side) / 2)
-                oy = int((h - side) / 2)
-
-                pad = max(12, int(side * 0.06))
-                gap = max(10, int(side * 0.04))
-                an_w = max(36, int(side * 0.12))
-
-                label_space = max(18, int(side * 0.07))
-                avail_h = side - label_space
-                mat_w = int((side - 2 * pad - 2 * gap - an_w) / 2)
-                mat_h = int((avail_h - 2 * pad - gap) / 2)
-                an_h = mat_h * 2 + gap
-
-                x0 = ox + pad
-                y0 = oy + pad
-                tl = (x0, y0, x0 + mat_w, y0 + mat_h)
-                bl = (x0, y0 + mat_h + gap, x0 + mat_w, y0 + 2 * mat_h + gap)
-                ax0 = x0 + mat_w + gap
-                an = (ax0, y0, ax0 + an_w, y0 + an_h)
-                rx0 = ax0 + an_w + gap
-                tr = (rx0, y0, rx0 + mat_w, y0 + mat_h)
-                br = (rx0, y0 + mat_h + gap, rx0 + mat_w, y0 + 2 * mat_h + gap)
-
-                font_an = ("Segoe UI", max(8, int(side * 0.035)), "bold")
-                font_owner = ("Segoe UI", max(8, int(side * 0.03)))
-                font_mat_lbl = ("Segoe UI", max(7, int(side * 0.028)), "bold")
-                font_ft = ("Segoe UI", max(6, int(side * 0.021)))
-
-                def draw_mat(rect: tuple[float, float, float, float], mat_id: int) -> None:
-                    rx0_, ry0, rx1_, ry1 = rect
-                    rw = rx1_ - rx0_
-                    rh = ry1 - ry0
-                    ft_h = max(11.0, min(rh * 0.22, 28.0))
-                    gy1 = ry1 - ft_h
-                    outline_col = "#2f2f2f"
-                    entry = mat_cache.get(mat_id)
-                    if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
-                        qkey = str(self.quad_var.get()).strip().upper()
-                        cached = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
-                        if isinstance(cached, dict):
-                            entry = cached
-                    err_t = None
-                    if isinstance(entry, dict) and entry.get("_err"):
-                        err_t = str(entry["_err"])
-                        outline_col = "#c62828"
-
-                    c.create_rectangle(rx0_, ry0, rx1_, ry1, fill="#fafafa", outline=outline_col, width=2)
-                    c.create_text(
-                        (rx0_ + rx1_) / 2,
-                        ry0 + max(7.0, rh * 0.08),
-                        text=f"MAT {mat_id}",
-                        font=font_mat_lbl,
-                        fill="#1f1f1f",
-                    )
-
-                    ix0 = rx0_ + 2
-                    iy0 = ry0 + max(11.0, rh * 0.14)
-                    ix1 = rx1_ - 2
-                    iy1 = max(iy0 + 4, gy1 - 2)
-                    gw = ix1 - ix0
-                    gh = iy1 - iy0
-                    if gw < 8 or gh < 8:
-                        return
-
-                    pix_on: Optional[list[bool]] = None
-                    fe_on: Optional[list[bool]] = None
-                    ftdac: Optional[list[int]] = None
-                    if isinstance(entry, dict) and not entry.get("_err"):
-                        po = entry.get("pix_on")
-                        fo = entry.get("fe_on")
-                        ft = entry.get("ftdac")
-                        if isinstance(po, list) and isinstance(ft, list) and len(po) >= 64 and len(ft) >= 64:
-                            pix_on = [bool(x) for x in po[:64]]
-                            ftdac = [int(x) for x in ft[:64]]
-                            if isinstance(fo, list) and len(fo) >= 64:
-                                fe_on = [bool(x) for x in fo[:64]]
-
-                    cell_w = gw / 8.0
-                    cell_h = gh / 8.0
-                    cg = max(0.4, min(cell_w, cell_h) * 0.06)
-                    for row in range(8):
-                        for col in range(8):
-                            ch = row * 8 + col
-                            cx0 = ix0 + col * cell_w + cg
-                            cy0 = iy0 + row * cell_h + cg
-                            cx1 = ix0 + (col + 1) * cell_w - cg
-                            cy1 = iy0 + (row + 1) * cell_h - cg
-                            if pix_on is not None:
-                                # Match block-detail view: green=ON, red=OFF (user expects "spenti" = rosso).
-                                if fe_on is not None and not fe_on[ch]:
-                                    fill = "#bdbdbd"
-                                else:
-                                    fill = "#2e7d32" if pix_on[ch] else "#aa2222"
-                                ol = "#37474f"
-                            elif self.offline:
-                                fill = "#eeeeee"
-                                ol = "#90a4ae"
-                            else:
-                                fill = "#f5f5f5"
-                                ol = "#b0bec5"
-                            c.create_rectangle(cx0, cy0, cx1, cy1, fill=fill, outline=ol, width=1)
-
-                    ft_y = (gy1 + ry1) / 2
-                    if err_t:
-                        ft_msg = "lettura MAT errore"
-                        ft_fill = "#b71c1c"
-                    elif self.offline:
-                        ft_msg = "OFFLINE"
-                        ft_fill = "#616161"
-                    elif ftdac is not None:
-                        nd = sum(1 for x in ftdac if int(x) != 15)
-                        if nd > 0:
-                            ft_msg = "CalibrazioneFTDAC DONE!"
-                            ft_fill = "#1565c0"
-                        else:
-                            ft_msg = "CalibrazioneFTDAC: solo FT=15"
-                            ft_fill = "#757575"
-                    else:
-                        ft_msg = "…"
-                        ft_fill = "#9e9e9e"
-
-                    c.create_text((rx0_ + rx1_) / 2, ft_y, text=ft_msg, font=font_ft, fill=ft_fill)
-
-                draw_mat(tl, mat_tl)
-                draw_mat(tr, mat_tr)
-                draw_mat(bl, mat_bl)
-                draw_mat(br, mat_br)
-
-                c.create_rectangle(*an, fill=an_fill, outline="#aa0000", width=2)
-                c.create_text(
-                    (an[0] + an[2]) / 2,
-                    (an[1] + an[3]) / 2,
-                    text="ANALOG\nSERVICES",
-                    angle=90,
-                    font=font_an,
-                    fill="#7a0000",
-                    justify="center",
-                )
-                c.create_text(
-                    ox + side / 2,
-                    oy + side - (label_space / 2),
-                    text=f"owner MAT {owner}",
-                    font=font_owner,
-                    fill="#3a3a3a",
-                )
-
-            def schedule_fetch() -> None:
-                if bool(getattr(self, "_snapshot_capture_in_progress", False)):
-                    return
-                if (not bool(getattr(self, "_blocks_view_force_hw", False))) and self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
-                    qkey = str(self.quad_var.get()).strip().upper()
-                    cached_for_quad = self._mat_snapshot_cache.get(qkey, {})
-                    # Skip HW reads if we already have cached MAT data for this block.
-                    if all(int(mid) in cached_for_quad for mid in mats):
-                        return
-                if _fetch_after[0] is not None:
-                    try:
-                        self.after_cancel(_fetch_after[0])
-                    except Exception:
-                        pass
-                    _fetch_after[0] = None
-
-                def fire() -> None:
-                    _fetch_after[0] = None
-                    if self.offline:
-                        return
-                    gen = _fetch_gen[0] + 1
-                    _fetch_gen[0] = gen
-                    quad_q = self.quad_var.get()
-
-                    def work() -> None:
-                        try:
-                            out: dict[int, dict[str, object]] = {}
-                            for mid in mats:
-                                # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
-                                # Never touch them directly here (block 1 is MAT 4..7).
-                                if 4 <= int(mid) <= 7:
-                                    continue
-                                out[mid] = self.hw.readMatPixelsAndFTDAC(quad_q, mattonella=mid)
-
-                            def apply_ok() -> None:
-                                if gen != _fetch_gen[0]:
-                                    return
-                                for mid in mats:
-                                    if mid in out:
-                                        mat_cache[mid] = out[mid]
-                                redraw_display()
-
-                            self.after(0, apply_ok)
-                        except Exception as e:
-                            err_s = str(e)
-
-                            def apply_err() -> None:
-                                if gen != _fetch_gen[0]:
-                                    return
-                                for mid in mats:
-                                    mat_cache[mid] = {"_err": err_s}
-                                redraw_display()
-
-                            self.after(0, apply_err)
-
-                    threading.Thread(target=work, daemon=True).start()
-
-                _fetch_after[0] = self.after(260, fire)
-
-            def on_configure(_ev=None) -> None:
-                redraw_display()
-                schedule_fetch()
-
-            c.bind("<Configure>", on_configure)
-            redraw_display()
-            schedule_fetch()
-
-            # click anywhere to open
-            def go(_ev=None) -> None:
-                self._open_block(block_id)
-
-            outer.bind("<Button-1>", go)
-            title.bind("<Button-1>", go)
-            c.bind("<Button-1>", go)
-            outer.bind("<Return>", go)
-
-            return outer
-
-        _refreshers: list[object] = []
         for block_id in range(4):
-            w = make_block_widget(grid, block_id=block_id)
+            w = self._make_block_diagram(grid, block_id, compact=False)
             r, c = divmod(block_id, 2)
             w.grid(row=r, column=c, padx=12, pady=12, sticky="nsew")
             grid.grid_columnconfigure(c, weight=1)
@@ -3130,7 +3507,7 @@ class Ignite64Gui(tk.Tk):
             text="FIFO…",
             command=lambda q=str(self.quad_var.get()).strip().upper(): self._open_fifo_popup(q),
         ).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="Calibra canali…", command=lambda bid=block_id: self._calib_block_threshold(bid)).pack(
+        ttk.Button(toolbar, text="Calibrate channels…", command=lambda bid=block_id: self._calib_block_threshold(bid)).pack(
             side="left", padx=(6, 0)
         )
         # ALL toggles for this block
@@ -3244,13 +3621,27 @@ class Ignite64Gui(tk.Tk):
                 self._fifo_log(out, f"0x{w:016X}")
                 summary.set(f"Q={q}: raw 0x{w:016X}")
                 return
-            d = d0 if d0 else self._fifo_decode_word(w)
-            self._fifo_log(
-                out,
-                f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
-                f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
+            dd = self._fifo_decode_word_tdc(w, quad=q)
+            mat = int(dd.get("mat", 0) or 0)
+            ch = int(dd.get("channel", 0) or 0)
+            cal_mode = dd.get("cal_mode")
+            pix = dd.get("pix")
+            lsb = dd.get("lsb_ps")
+            ta = dd.get("ta_ps")
+            tot = dd.get("tot_ps")
+            msg = (
+                f"MAT={mat:2d}  CH={ch:2d}  "
+                f"cnt={int(dd.get('fifo_cnt', 0) or 0):3d} empty={int(dd.get('fifo_empty', 0) or 0)} "
+                f"full={int(dd.get('fifo_full', 0) or 0)} half={int(dd.get('fifo_halffull', 0) or 0)}"
             )
-            summary.set(f"Q={q}: MAT={d['mat']:02d} CH={d['channel']:02d} empty={d['fifo_empty']} cnt={d['fifo_cnt']}")
+            if isinstance(cal_mode, int) and isinstance(pix, int):
+                msg += f"  cal={cal_mode} pix={pix:2d}"
+            if isinstance(lsb, float) and lsb > 0.0:
+                msg += f"  LSB={lsb:.2f}ps"
+            if isinstance(ta, float) and isinstance(tot, float):
+                msg += f"  TA={ta:.2f}ps TOT={tot:.2f}ps"
+            self._fifo_log(out, msg)
+            summary.set(f"Q={q}: MAT={mat:02d} CH={ch:02d} cnt={int(dd.get('fifo_cnt', 0) or 0)}")
 
         def drain(decoded: bool) -> None:
             def do() -> list[int]:
@@ -3279,12 +3670,26 @@ class Ignite64Gui(tk.Tk):
                 if not decoded:
                     self._fifo_log(out, f"0x{w:016X}")
                 else:
-                    d = self._fifo_decode_word(w)
-                    self._fifo_log(
-                        out,
-                        f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
-                        f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
+                    dd = self._fifo_decode_word_tdc(w, quad=q)
+                    mat = int(dd.get("mat", 0) or 0)
+                    ch = int(dd.get("channel", 0) or 0)
+                    cal_mode = dd.get("cal_mode")
+                    pix = dd.get("pix")
+                    lsb = dd.get("lsb_ps")
+                    ta = dd.get("ta_ps")
+                    tot = dd.get("tot_ps")
+                    msg = (
+                        f"MAT={mat:2d}  CH={ch:2d}  "
+                        f"cnt={int(dd.get('fifo_cnt', 0) or 0):3d} empty={int(dd.get('fifo_empty', 0) or 0)} "
+                        f"full={int(dd.get('fifo_full', 0) or 0)} half={int(dd.get('fifo_halffull', 0) or 0)}"
                     )
+                    if isinstance(cal_mode, int) and isinstance(pix, int):
+                        msg += f"  cal={cal_mode} pix={pix:2d}"
+                    if isinstance(lsb, float) and lsb > 0.0:
+                        msg += f"  LSB={lsb:.2f}ps"
+                    if isinstance(ta, float) and isinstance(tot, float):
+                        msg += f"  TA={ta:.2f}ps TOT={tot:.2f}ps"
+                    self._fifo_log(out, msg)
 
         ttk.Button(btns, text="Read 1 (decoded)", command=lambda: read_one(True)).pack(side="left", padx=3)
         ttk.Button(btns, text="Read 1 (raw)", command=lambda: read_one(False)).pack(side="left", padx=3)
@@ -3325,7 +3730,7 @@ class Ignite64Gui(tk.Tk):
         mats = self.mapping.mats_in_block(int(block_id))
 
         win = tk.Toplevel(self)
-        win.title(f"Calibrazione soglia — Block {block_id} (Q={quad})")
+        win.title(f"Threshold calibration — Block {block_id} (Q={quad})")
         win.transient(self)
         win.resizable(True, True)
 
@@ -3335,15 +3740,15 @@ class Ignite64Gui(tk.Tk):
         ttk.Label(
             root,
             text=(
-                "Calibrazione blocco: calibra canale per canale via FIFO.\n"
-                "Per ogni canale abilita PIXON+FEON (solo quel canale) e abilita TDCON della MAT.\n"
-                "Nota: MAT 4..7 vengono saltate (accesso I2C diretto disabilitato)."
+                "Block calibration: calibrate channel-by-channel via FIFO.\n"
+                "For each channel enable PIXON+FEON (that channel only) and TDCON for the MAT.\n"
+                "Note: MAT 4..7 are skipped (direct I2C access disabled)."
             ),
             font=("Segoe UI", 9),
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
-        params = ttk.Labelframe(root, text="Parametri", padding=8)
+        params = ttk.Labelframe(root, text="Parameters", padding=8)
         params.pack(fill="x", pady=(0, 8))
 
         step_code = tk.StringVar(value="1")
@@ -3548,13 +3953,13 @@ class Ignite64Gui(tk.Tk):
                 sch = max(0, min(63, int(sch)))
                 log(f"RESUME from MAT {int(sm)} CH {int(sch)}")
                 resume_started = False
-                self.after(0, lambda: status.set("Calibrazione: start canali…"))
+                self.after(0, lambda: status.set("Calibration: starting channels…"))
                 log(f"BLOCK {block_id} mats={mats}")
 
                 # During calibration keep ONLY the current channel active:
                 # - disable all PIXON in this block
                 # - disable TDCON for the MATs in this block
-                self.after(0, lambda: status.set("Preparazione: spegni PIXON/TDCON (solo canale corrente durante calib)…"))
+                self.after(0, lambda: status.set("Prep: turning off PIXON/TDCON (only current channel active during calib)…"))
                 for mid in mats:
                     if stop_evt.is_set():
                         return
@@ -3596,7 +4001,7 @@ class Ignite64Gui(tk.Tk):
                             pass
                         self.after(
                             0,
-                            lambda m=mid, c=ch, code=sc: status.set(f"Calibrando MAT {m} CH {c} (start={code})…"),
+                            lambda m=mid, c=ch, code=sc: status.set(f"Calibrating MAT {m} CH {c} (start={code})…"),
                         )
                         log(f"START MAT {int(mid)} CH {int(ch)} FTCODE={int(sc)}")
                         try:
@@ -3618,7 +4023,7 @@ class Ignite64Gui(tk.Tk):
                                 pass
                             continue
                         if stop_evt.is_set():
-                            self.after(0, lambda: status.set("ABORT: errore USB/DLL (WDU). Riparti da Start MAT/CH."))
+                            self.after(0, lambda: status.set("ABORT: USB/DLL error (WDU). Resume from Start MAT/CH."))
                             return
                         if calib is None:
                             log(f"NOHIT MAT {int(mid)} CH {int(ch)} (reached min={mn})")
@@ -3638,7 +4043,7 @@ class Ignite64Gui(tk.Tk):
                             pass
 
                 # Restore state for verification: enable PIXON + TDCON for all pixels of the block.
-                self.after(0, lambda: status.set("Ripristino: riaccendi PIXON+TDCON per tutto il blocco…"))
+                self.after(0, lambda: status.set("Restore: turning PIXON+TDCON back on for whole block…"))
                 for mid in mats:
                     if stop_evt.is_set():
                         return
@@ -3656,10 +4061,10 @@ class Ignite64Gui(tk.Tk):
                         except Exception:
                             pass
 
-                self.after(0, lambda: status.set("FINE: calibrazione blocco completata."))
+                self.after(0, lambda: status.set("DONE: block calibration completed."))
                 log("DONE: block calibration completed.")
             except Exception as e:
-                self.after(0, lambda e=e: status.set(f"ERRORE: {e}"))
+                self.after(0, lambda e=e: status.set(f"ERROR: {e}"))
                 self.after(0, lambda e=e: log(f"ERROR: {e!r}"))
 
         def start() -> None:
@@ -3668,7 +4073,7 @@ class Ignite64Gui(tk.Tk):
 
         def stop() -> None:
             stop_evt.set()
-            status.set("Stop richiesto…")
+            status.set("Stop requested…")
 
         btns = ttk.Frame(root)
         btns.pack(fill="x", pady=(8, 0))
@@ -3843,7 +4248,7 @@ class Ignite64Gui(tk.Tk):
     def _open_ftdac_popup(self, mat_id: int, pix_id: int) -> None:
         quad = self.quad_var.get()
         if 4 <= int(mat_id) <= 7:
-            self._set_status(f"MAT {mat_id}: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            self._set_status(f"MAT {mat_id}: direct I2C disabled (stack issue). Use broadcast / Calib DCO.")
             return
 
         win = tk.Toplevel(self)
@@ -3971,6 +4376,50 @@ class Ignite64Gui(tk.Tk):
             command=lambda: _apply_feon(bool(feon_flag.get())),
         ).pack(anchor="w", pady=(2, 0))
 
+        # --- TDC calibration results (from Calib DCO dialog) ---
+        dco_box = ttk.Labelframe(win, text="TDC calibration (DCO)", padding=(10, 6))
+        dco_box.pack(fill="x", padx=10, pady=(10, 0))
+        dco0_var = tk.StringVar(value="—")
+        dco1_var = tk.StringVar(value="—")
+        lsb_var = tk.StringVar(value="—")
+
+        drow = ttk.Frame(dco_box)
+        drow.pack(fill="x")
+        ttk.Label(drow, text="DCO0_T (ps):", width=14).pack(side="left")
+        ttk.Label(drow, textvariable=dco0_var, width=14).pack(side="left")
+        ttk.Label(drow, text="DCO1_T (ps):", width=14).pack(side="left", padx=(12, 0))
+        ttk.Label(drow, textvariable=dco1_var, width=14).pack(side="left")
+        drow2 = ttk.Frame(dco_box)
+        drow2.pack(fill="x", pady=(4, 0))
+        ttk.Label(drow2, text="LSB (ps):", width=14).pack(side="left")
+        ttk.Label(drow2, textvariable=lsb_var, width=14).pack(side="left")
+
+        def _refresh_dco_cache_view() -> None:
+            k = (str(quad).strip().upper(), int(mat_id), int(pix_id))
+            d = self._dco_calib_cache.get(k)
+            if not isinstance(d, dict):
+                dco0_var.set("—")
+                dco1_var.set("—")
+                lsb_var.set("—")
+                return
+            try:
+                d0 = float(d.get("dco0_ps", 0.0))
+                d1 = float(d.get("dco1_ps", 0.0))
+                lsb = float(d.get("lsb_ps", 0.0))
+            except Exception:
+                dco0_var.set("—")
+                dco1_var.set("—")
+                lsb_var.set("—")
+                return
+            if d0 <= 0.0 or d1 <= 0.0 or lsb <= 0.0:
+                dco0_var.set("—")
+                dco1_var.set("—")
+                lsb_var.set("—")
+                return
+            dco0_var.set(f"{d0:.2f}")
+            dco1_var.set(f"{d1:.2f}")
+            lsb_var.set(f"{lsb:.2f}")
+
         def _read_cur() -> None:
             def do() -> int:
                 return int(self.hw.readAnalogChannelFineTune(quad, mattonella=int(mat_id), canale=int(pix_id)))
@@ -3980,6 +4429,7 @@ class Ignite64Gui(tk.Tk):
                 return
             cur_var.set(str(int(v)))
             _read_states()
+            _refresh_dco_cache_view()
 
         def _apply(code: int) -> None:
             code = int(code)
@@ -4008,7 +4458,7 @@ class Ignite64Gui(tk.Tk):
         btns.pack(fill="x")
         ttk.Button(btns, text="Refresh", command=_read_cur).pack(side="left")
         ttk.Button(btns, text="Set", command=_on_set).pack(side="left", padx=(6, 0))
-        ttk.Button(btns, text="Calibra canale…", command=lambda: self._calib_pixel_threshold(mat_id, pix_id)).pack(
+        ttk.Button(btns, text="Calibrate channel…", command=lambda: self._calib_pixel_threshold(mat_id, pix_id)).pack(
             side="right"
         )
 
@@ -4049,11 +4499,11 @@ class Ignite64Gui(tk.Tk):
         """
         quad = str(self.quad_var.get()).strip().upper()
         if 4 <= int(mat_id) <= 7:
-            self._set_status(f"MAT {mat_id}: calibrazione disabilitata (I2C stack issue).")
+            self._set_status(f"MAT {mat_id}: calibration disabled (I2C stack issue).")
             return
 
         win = tk.Toplevel(self)
-        win.title(f"Calibrazione soglia — Q={quad} MAT={mat_id} PIX={pix_id}")
+        win.title(f"Threshold calibration — Q={quad} MAT={mat_id} PIX={pix_id}")
         win.transient(self)
         win.resizable(True, True)
 
@@ -4063,15 +4513,15 @@ class Ignite64Gui(tk.Tk):
         info = ttk.Label(
             root,
             text=(
-                "Procedura: diminuisce FTCODE (FTDAC) fino a quando compare un hit in FIFO.\n"
-                "Al primo hit, imposta il codice precedente e termina."
+                "Procedure: decrease FTCODE (FTDAC) until a FIFO hit appears.\n"
+                "On first hit, set the previous code and stop."
             ),
             font=("Segoe UI", 9),
             justify="left",
         )
         info.pack(anchor="w", pady=(0, 8))
 
-        params = ttk.Labelframe(root, text="Parametri", padding=8)
+        params = ttk.Labelframe(root, text="Parameters", padding=8)
         params.pack(fill="x", pady=(0, 8))
 
         start_code = tk.StringVar(value="")
@@ -4204,7 +4654,7 @@ class Ignite64Gui(tk.Tk):
                     pass
 
                 prev_code = cur
-                self.after(0, lambda: status.set(f"Calibrazione in corso… start={cur} step={step} min={mn}"))
+                self.after(0, lambda: status.set(f"Calibrating… start={cur} step={step} min={mn}"))
                 self.after(0, lambda: log(f"START: current FTCODE={cur}"))
 
                 code = cur
@@ -4236,7 +4686,7 @@ class Ignite64Gui(tk.Tk):
                         self.hw.AnalogChannelFineTune(
                             quad, block=0, mattonella=int(mat_id), canale=int(pix_id), valore=int(calib)
                         )
-                        self.after(0, lambda c=calib: status.set(f"CALIBRATO: FTCODE={c} (hit a {code})"))
+                        self.after(0, lambda c=calib: status.set(f"CALIBRATED: FTCODE={c} (hit at {code})"))
                         self.after(0, lambda c=calib: log(f"DONE: calibrated FTCODE={c} (hit at {code})"))
                         # Update block mini view numbers/colors
                         self.after(0, lambda c=calib: self._update_ftdac_cell(int(mat_id), int(pix_id), int(c)))
@@ -4245,10 +4695,10 @@ class Ignite64Gui(tk.Tk):
                     prev_code = code
                     code -= step
 
-                self.after(0, lambda: status.set("STOP: nessun hit (raggiunto min o interrotto)."))
+                self.after(0, lambda: status.set("STOP: no hit (min reached or interrupted)."))
                 self.after(0, lambda: log("STOP: no hit"))
             except Exception as e:
-                self.after(0, lambda e=e: status.set(f"ERRORE: {e}"))
+                self.after(0, lambda e=e: status.set(f"ERROR: {e}"))
                 self.after(0, lambda e=e: log(f"ERROR: {e!r}"))
 
         def start() -> None:
@@ -4257,7 +4707,7 @@ class Ignite64Gui(tk.Tk):
 
         def stop() -> None:
             stop_evt.set()
-            status.set("Stop richiesto…")
+            status.set("Stop requested…")
 
         btns = ttk.Frame(root)
         btns.pack(fill="x", pady=(8, 0))
@@ -4275,7 +4725,7 @@ class Ignite64Gui(tk.Tk):
         quad = self.quad_var.get()
         # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
         if 4 <= int(mat_id) <= 7:
-            self._set_status(f"MAT {mat_id}: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            self._set_status(f"MAT {mat_id}: direct I2C disabled (stack issue). Use broadcast / Calib DCO.")
             _dbg(f"toggle pixel blocked: MAT {mat_id} in [4..7] (known I2C stack issue)")
             return
 
@@ -4606,7 +5056,7 @@ class Ignite64Gui(tk.Tk):
             ttk.Spinbox(br, from_=0, to=7, textvariable=self._afe_disc_var, width=5).pack(side="left", padx=(0, 10))
             ttk.Label(br, text="I_KRUM:", width=8).pack(side="left")
             ttk.Spinbox(br, from_=0, to=15, textvariable=self._afe_krum_var, width=5).pack(side="left", padx=(0, 10))
-            ttk.Button(br, text="Applica", command=lambda: self._set_afe_bias(block_id)).pack(side="left", padx=6)
+            ttk.Button(br, text="Apply", command=lambda: self._set_afe_bias(block_id)).pack(side="left", padx=6)
 
         # Reuse the same state variables used by the full analog view.
         self._dac_vars = {}
@@ -4752,7 +5202,7 @@ class Ignite64Gui(tk.Tk):
         quad = self.quad_var.get()
         # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
         if 4 <= int(mat_id) <= 7:
-            self._set_status(f"MAT {mat_id}: refresh disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            self._set_status(f"MAT {mat_id}: refresh disabled (I2C stack issue). Use broadcast / Calib DCO.")
             return
 
         def do() -> list[bool]:
@@ -4773,7 +5223,7 @@ class Ignite64Gui(tk.Tk):
         quad = self.quad_var.get()
         # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
         if 4 <= int(mat_id) <= 7:
-            self._set_status(f"MAT {mat_id}: toggle disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            self._set_status(f"MAT {mat_id}: toggle disabled (I2C stack issue). Use broadcast / Calib DCO.")
             return
 
         def do() -> bool:
