@@ -1,0 +1,14 @@
+---
+description: Contesto e convenzioni per il pacchetto Python ignite64py
+globs: ignite64py/**/*.py
+alwaysApply: false
+---
+
+# ignite64py (Python)
+
+- **API pubblica**: classe `Ignite64` in `ignite64py/api.py`; trasporto e I2C in `device.py`; caricamento DLL in `dll.py`.
+- Prima di accessi MAT/TOP sul quadrante corretto: `select_quadrant(quad)` (molti metodi lo chiamano già internamente).
+- **GUI**: `ignite64py/gui_tk.py`, avvio da `examples/gui_monitor.py` → `run_gui()`.
+- **Macro**: implementazioni riusabili in `macros_library.py` (`builtin_*`); script sottili in `examples/macros/` con parametri in cima al file.
+- **Documentazione**: aggiornare `docs/` quando si aggiungono metodi pubblici o dipendenze.
+- Evitare refactor estesi non richiesti; seguire lo stile esistente (italiano nei messaggi utente dove già usato).

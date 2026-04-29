@@ -1,0 +1,11 @@
+---
+description: Panoramica repository IGNITE64 (Python + C# legacy)
+alwaysApply: true
+---
+
+# Repository tb_ignite64_source
+
+- Radice: progetto **C#** `tb_Ignite64` (.NET Framework) come riferimento GUI legacy; cartella **`ignite64py/`** = wrapper Python + Tk GUI + docs.
+- DLL **non** versionate di default (`.gitignore`: `*.dll`); istruzioni in `ignite64py/docs/INSTALLAZIONE_WINDOWS.md`.
+- Per contesto esteso leggere **`AGENTS.md`** nella radice e **`CONTRIBUTING.md`** per clone/commit.
+- Documentazione operativa API/macro: **`ignite64py/docs/GUIDA_HW_E_MACRO.md`**.

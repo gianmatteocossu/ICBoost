@@ -1,0 +1,2 @@
+# Normalizzazione fine riga (evita diff solo CRLF/LF)
+* text=auto

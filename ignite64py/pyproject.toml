@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ignite64py"
+version = "0.1.0"
+description = "Python wrapper for Ignite64 C# hardware DLLs (TCPtoI2C.dll, USBtoI2C32.dll)"
+requires-python = ">=3.9"
+dependencies = [
+  "pillow",
+]
+
+[tool.setuptools]
+packages = ["ignite64py"]
+
+[tool.setuptools.package-data]
+ignite64py = ["assets/*.png", "assets/*.jpg", "assets/*.jpeg"]
+

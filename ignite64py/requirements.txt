@@ -1,0 +1,4 @@
+# Installare con:  python -m pip install -r requirements.txt
+# Interprete: Python 3.10 o superiore (consigliato 3.11 / 3.12 su Windows).
+
+pillow>=9.0

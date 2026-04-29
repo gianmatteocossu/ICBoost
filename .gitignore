@@ -1,0 +1,49 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+htmlcov/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+.vs/
+*.swp
+*~
+
+# --- Windows / OS ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Visual Studio / MSBuild (progetto C# in radice) ---
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.userosscache
+*.suo
+# *.cache MSBuild — tipicamente sotto obj/
+*.ilk
+*.pdb
+
+# --- DLL bridge hardware (copiare da installazione tool C#; spesso non ridistribuibili) ---
+*.dll
+
+# --- Cursor (cache locale; le regole in .cursor/rules/ restano versionate) ---
+# (nessun ignore globale per .cursor/ — si versionano rules + contesto)
