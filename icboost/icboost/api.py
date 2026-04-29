@@ -270,11 +270,13 @@ class Ignite64(Ignite64LowLevel):
 
         quad = str(quad).strip().upper()
         mat = int(Mattonella)
+        if mat < 0 or mat > 15:
+            raise ValueError("Mattonella out of range (expected 0..15)")
 
         # Ensure I2C readout is selected on TOP (needed for FIFO reads).
         try:
             self.TopReadout("i2c")
-        except Exception:
+        except (Ignite64TransportError, OSError, ValueError, RuntimeError, AttributeError):
             pass
 
         self.select_quadrant(quad)
@@ -1103,7 +1105,10 @@ class Ignite64(Ignite64LowLevel):
           - ftdac:  list[int]  length 64 (FineTune DAC code 0..15 from regs 76..107)
         """
         self.select_quadrant(quad)
-        dev = self.matid_to_devaddr(int(mattonella))
+        m = int(mattonella)
+        if m < 0 or m > 15:
+            raise ValueError("mattonella out of range (expected 0..15)")
+        dev = self.matid_to_devaddr(m)
 
         # Pixel regs 0..63: bit6 is PIXON
         pix_bytes = self.i2c_read_bytes(dev, 0x00, 64)

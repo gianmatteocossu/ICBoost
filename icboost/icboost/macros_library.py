@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Optional
 
+from .device import Ignite64TransportError
+
 # Metadata for the GUI combobox: id, short label, whether to run in a worker thread (FIFO cal can take minutes)
 MACRO_REGISTRY: list[tuple[str, str, bool]] = [
     ("ftdac_delta_mat", "FTDAC: sposta tutti i canali (±Δ, chiede MAT)", False),
@@ -175,6 +177,8 @@ def builtin_vthr_bump(hw, quad: str, *, mat: int, dac: str, delta: int) -> dict[
     """
     q = _q(quad)
     mat = int(mat)
+    if mat < 0 or mat > 15:
+        raise ValueError("mat atteso 0..15")
     delta = int(delta)
     key = dac.strip().upper()
     if key in ("VTH_H", "VTHR_H", "HIGH", "ALTA"):
@@ -204,6 +208,8 @@ def builtin_ftdac_dump(hw, quad: str, *, mat: int) -> dict[str, Any]:
     """Return FTDAC codes for logging / debugging (no hardware change)."""
     q = _q(quad)
     mat = int(mat)
+    if mat < 0 or mat > 15:
+        raise ValueError("mat atteso 0..15")
     hw.select_quadrant(q)
     d = hw.readMatPixelsAndFTDAC(q, mattonella=mat)
     ft = d.get("ftdac")
@@ -221,12 +227,12 @@ def builtin_prepare_fifo_readout(hw, quad: str) -> dict[str, Any]:
     q = _q(quad)
     try:
         hw.TopReadout("i2c")
-    except Exception as e:
+    except (Ignite64TransportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         return {"quad": q, "ok": False, "error": str(e)}
     hw.select_quadrant(q)
     try:
         ro = str(hw.readTopReadout())
-    except Exception:
+    except (Ignite64TransportError, OSError, ValueError, RuntimeError, AttributeError):
         ro = "?"
     return {"quad": q, "ok": True, "readout": ro}
 

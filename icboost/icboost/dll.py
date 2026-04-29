@@ -40,8 +40,8 @@ def resolve_dlls(dll_dir: "Optional[Union[str, os.PathLike]]" = None) -> DllPath
         usb = base / usb_name
         if not tcp.exists():
             raise Ignite64DllError(f"Missing {tcp_name} in {base}")
-        # USB DLL can be loaded lazily; keep path even if missing
-        # (it will raise only when USB features are used)
+        if not usb.exists():
+            raise Ignite64DllError(f"Missing {usb_name} in {base}")
         return DllPaths(tcp_to_i2c=tcp, usb_to_i2c=usb)
 
     # If no dll_dir, we still return names as Paths (LoadLibrary will use PATH)

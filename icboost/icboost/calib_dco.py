@@ -68,10 +68,13 @@ def raw_fifo_to_fields(data_fifo_raw: int) -> dict[str, object]:
 def _dco_period_ps(*, cal_mode: int, de: Optional[int], cal_time: Optional[int], cnt_tot: int) -> float:
     if cal_mode != 1:
         raise ValueError("DCO period expects CAL_Mode == 1")
+    ct = int(cnt_tot)
+    if ct <= 0:
+        raise ValueError("cnt_tot must be > 0 for DCO period")
     if de == 0:
-        return (2.0 ** int(cal_time)) * 400.0 * 1000.0 / float(cnt_tot)
+        return (2.0 ** int(cal_time)) * 400.0 * 1000.0 / float(ct)
     if de == 1:
-        return (2.0 ** int(cal_time)) * 400.0 * 1000.0 / (2.0 * float(cnt_tot))
+        return (2.0 ** int(cal_time)) * 400.0 * 1000.0 / (2.0 * float(ct))
     raise ValueError("DE must be 0 or 1 for DCO period")
 
 
