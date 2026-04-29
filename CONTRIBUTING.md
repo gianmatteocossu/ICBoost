@@ -1,5 +1,22 @@
 # Contribuire e pubblicare su Git
 
+## Identità Git (obbligatoria al primo `commit`)
+
+Dopo aver installato Git, configura nome ed email (una sola volta sul PC):
+
+```text
+git config --global user.name "Nome Cognome"
+git config --global user.email "tua.email@istituzione.it"
+```
+
+Solo per questo repository (senza `--global`):
+
+```text
+cd <cartella-repo>
+git config user.name "Nome Cognome"
+git config user.email "tua.email@istituzione.it"
+```
+
 ## Primo clone (sviluppatore)
 
 ```text
