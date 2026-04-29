@@ -24,11 +24,11 @@ git clone <URL-del-tuo-repository>
 cd <cartella-repo>
 ```
 
-Struttura attesa: radice con **`icboost/`** (pacchetto Python), `tb_Ignite64/`, `README.md`, `AGENTS.md`, `.gitignore`. Il nome della cartella progetto può essere ancora `ignite64py/` finché non viene rinominata.
+Struttura attesa: radice con **`icboost/`** (pacchetto Python), `tb_Ignite64/`, `README.md`, `AGENTS.md`, `.gitignore`. Il nome storico della cartella era `ignite64py/`; i working copy aggiornati usano `icboost/`.
 
 ### Ambiente Python
 
-Seguire **[ignite64py/docs/INSTALLAZIONE_WINDOWS.md](ignite64py/docs/INSTALLAZIONE_WINDOWS.md)** finché la cartella non è rinominata — poi **`icboost/docs/...`** (venv, `pip install -e .` dalla cartella progetto).
+Seguire **[icboost/docs/INSTALLAZIONE_WINDOWS.md](icboost/docs/INSTALLAZIONE_WINDOWS.md)** (venv, `pip install -e .` dalla cartella progetto).
 
 ### DLL
 
