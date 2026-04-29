@@ -4,7 +4,7 @@ Una **chat** in Cursor non viene salvata automaticamente nel repository. Per lav
 
 | Elemento | Posizione | Scopo |
 |----------|-----------|--------|
-| **AGENTS.md** | Radice del repository (cartella che contiene `icboost/` e `tb_Ignite64/`) | Panoramica percorsi, convenzioni, cosa non è in repo (DLL). Cursor lo usa come contesto progetto. |
+| **AGENTS.md** | Radice del repository (cartella che contiene `icboost/` e `tb_Ignite64/`) | Panoramica percorsi, convenzioni, DLL bridge in `icboost/`. Cursor lo usa come contesto progetto. |
 | **.cursor/rules/*.mdc** | Stessa radice | Regole per l’assistente (panoramica repo, convenzioni Python). Modificabili dal team. |
 | **Documentazione** | `docs/` in questa cartella | Installazione, guida API/macro, riferimenti operativi. |
 | **CONTRIBUTING.md** | Radice | Clone, `git`, cosa versionare, DLL. |
