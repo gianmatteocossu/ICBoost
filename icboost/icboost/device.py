@@ -349,17 +349,33 @@ class Ignite64LowLevel:
             if a not in uniq:
                 uniq.append(a)
 
+        import os
+        import sys
         import time
+
+        debug = os.environ.get("IGNITE64_DEBUG", "").strip() not in ("", "0", "false", "False", "FALSE")
+
+        def _ck(msg: str) -> None:
+            if not debug:
+                return
+            sys.stderr.write(msg.rstrip() + "\n")
+            sys.stderr.flush()
+
+        _ck(f"[ignite64] autodetect_ioext_address: candidates={', '.join('0x%02X' % a for a in uniq)} retries={retries} delay_s={delay_s}")
 
         last_err: Optional[Exception] = None
         for _attempt in range(max(1, int(retries))):
+            _ck(f"[ignite64] autodetect_ioext_address: attempt={_attempt + 1}/{max(1, int(retries))}")
             for dev in uniq:
                 try:
+                    _ck(f"[ignite64] autodetect_ioext_address: probe read reg0 dev=0x{dev:02X}")
                     _ = self.i2c_read_byte(dev, 0)
                     self.addr.ioext_addr = dev
+                    _ck(f"[ignite64] autodetect_ioext_address: OK dev=0x{dev:02X}")
                     return dev
                 except Ignite64TransportError as e:
                     last_err = e
+                    _ck(f"[ignite64] autodetect_ioext_address: FAIL dev=0x{dev:02X} err={e!r}")
             time.sleep(max(0.0, float(delay_s)))
         raise Ignite64TransportError(
             f"Could not detect IOext address. Tried: {', '.join('0x%02X' % a for a in uniq)}"
@@ -379,14 +395,39 @@ class Ignite64LowLevel:
             a = int(a) & 0xFF
             if a not in candidates:
                 candidates.append(a)
-        dev = self.autodetect_ioext_address(candidates=candidates, retries=5, delay_s=0.05)
+        import os
+        import sys
+
+        debug = os.environ.get("IGNITE64_DEBUG", "").strip() not in ("", "0", "false", "False", "FALSE")
+
+        def _ck(msg: str) -> None:
+            if not debug:
+                return
+            sys.stderr.write(msg.rstrip() + "\n")
+            sys.stderr.flush()
+
+        _ck(f"[ignite64] ioext_init_defaults: ioext_addr(initial)=0x{int(self.addr.ioext_addr) & 0xFF:02X} candidates={', '.join('0x%02X' % a for a in candidates)}")
+        try:
+            dev = self.autodetect_ioext_address(candidates=candidates, retries=5, delay_s=0.05)
+        except Ignite64TransportError as e:
+            # Fallback C#-like:
+            # If probing IOext via a read of reg0 fails (bus/driver temporarily "stacked"),
+            # still try writing defaults using the current known ioext_addr.
+            dev = int(self.addr.ioext_addr) & 0xFF
+            if debug:
+                try:
+                    _ck(f"[ignite64] ioext_init_defaults: autodetect failed, fallback dev=0x{dev:02X} err={e!r}")
+                except Exception:
+                    pass
         defaults = [0x00] * 11
         defaults[0] = 0x80
         defaults[5] = 0x20
         defaults[9] = 0x34
         defaults[10] = 0x40
+        _ck(f"[ignite64] ioext_init_defaults: selected dev=0x{dev:02X} writing defaults (reg0..10)")
         # Mirror C# IOext_init(): write one register at a time
         for reg, val in enumerate(defaults):
+            _ck(f"[ignite64] ioext_init_defaults: write dev=0x{dev:02X} reg=0x{reg:02X} val=0x{val:02X}")
             self.i2c_write_byte(dev, reg, val)
 
     # ---- mux selection (quadrant) ----
@@ -599,5 +640,13 @@ class Ignite64LowLevel:
         # Copied from Ignite32_MATID_ToIntDevAddr: return 2 * abs(MatID)
         if mat_id < 0 or mat_id > 15:
             raise ValueError(f"mat_id out of range: {mat_id} (expected 0..15)")
+        # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+        # Enforce a hard guard here so callers can't accidentally hit them.
+        # (Broadcast writes use special MAT IDs >15 -> dev 254 and are unaffected.)
+        if 4 <= int(mat_id) <= 7:
+            raise Ignite64TransportError(
+                f"Direct MAT access disabled for mat_id={mat_id} (known I2C stack issue on MAT 4..7). "
+                "Use broadcast/CalibDCO47 workaround."
+            )
         return 2 * abs(mat_id)
 

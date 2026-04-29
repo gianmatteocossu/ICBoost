@@ -78,6 +78,52 @@ class Ignite64(Ignite64LowLevel):
             return 0
         raise Ignite64TransportError(f"FifoReadSingle: I2C_ReadArray(dev=0x{dev:02X}, sub=0x40, n=8) -> {rc}")
 
+    def FifoReadSingleRobust(
+        self,
+        *,
+        quad: Optional[str] = None,
+        retries: int = 6,
+        backoff_s: float = 0.003,
+        do_bus_recovery: bool = True,
+        ensure_i2c_readout: bool = True,
+    ) -> int:
+        """
+        Like FifoReadSingle(), but with retries and best-effort recovery.
+
+        This is useful during calibration loops where we interleave many I2C writes + FIFO reads
+        and the transport may transiently return rc=1.
+        """
+        last_err: Optional[Exception] = None
+        for i in range(max(1, int(retries))):
+            try:
+                if quad:
+                    try:
+                        self.select_quadrant(str(quad).strip().upper())
+                    except Exception:
+                        pass
+                if ensure_i2c_readout:
+                    try:
+                        self.TopReadout("i2c")
+                    except Exception:
+                        pass
+                return int(self.FifoReadSingle())
+            except Exception as e:
+                last_err = e
+                if do_bus_recovery:
+                    try:
+                        self.i2c_bus_recovery()
+                    except Exception:
+                        pass
+                # Small backoff (C# often uses Task.Delay(1..3))
+                try:
+                    time.sleep(max(0.0, float(backoff_s)) * float(i + 1))
+                except Exception:
+                    pass
+                continue
+        if last_err is None:
+            return 0
+        raise last_err
+
     def FifoReadNumWords(self, n_words: int) -> list[int]:
         """
         Read up to 24 FIFO words in one burst.
@@ -155,8 +201,12 @@ class Ignite64(Ignite64LowLevel):
         top = list(self.i2c_read_bytes(self.addr.top_addr, 0, 19))
 
         # MATs (always 0..15, 108 bytes each, regs 0..107)
+        # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+        # We skip them here; they remain in default state unless configured via broadcast.
         mats: dict[int, list[int]] = {}
         for mat_id in range(16):
+            if 4 <= int(mat_id) <= 7:
+                continue
             dev = self.matid_to_devaddr(mat_id)
             mats[mat_id] = list(self.i2c_read_bytes(dev, 0, 108))
 
@@ -177,6 +227,8 @@ class Ignite64(Ignite64LowLevel):
         lines.append("")
         lines.append("")
         for mat_id in range(16):
+            if 4 <= int(mat_id) <= 7:
+                continue
             lines.append(f"MAT {mat_id} ")
             lines.extend(str(int(b)) for b in mats[mat_id])
             lines.append("")
@@ -302,6 +354,8 @@ class Ignite64(Ignite64LowLevel):
         """
         self.select_quadrant(quad)
         for mat_id in range(16):
+            if 4 <= int(mat_id) <= 7:
+                continue
             dev = self.matid_to_devaddr(mat_id)
             try:
                 old = self.i2c_read_byte(dev, MatRegs.CAL_CONF)
@@ -309,6 +363,49 @@ class Ignite64(Ignite64LowLevel):
                 continue
             want = 0x80 if mat_id == int(block) else 0x00
             new = _update_masked_byte(old, mask=0x80, value=want)
+            try:
+                self.i2c_write_byte(dev, MatRegs.CAL_CONF, new)
+            except Ignite64TransportError:
+                continue
+
+    def _set_connect2pad_and_probes_only(
+        self,
+        quad: str,
+        *,
+        block: int,
+        en_p_vth: bool = True,
+        en_p_vldo: bool = True,
+        en_p_vfb: bool = True,
+    ) -> None:
+        """
+        C#-equivalent helper for analog probing: ensure only `block` has:
+          - EN_CON_PAD (bit7)
+          - EN_P_VTH  (bit6)
+          - EN_P_VLDO (bit5)
+          - EN_P_VFB  (bit4)
+
+        All other MATs get these bits cleared. Best-effort, skips unreachable MATs.
+        """
+        self.select_quadrant(quad)
+        mask = 0xF0
+        target_bits = 0x80
+        if bool(en_p_vth):
+            target_bits |= 0x40
+        if bool(en_p_vldo):
+            target_bits |= 0x20
+        if bool(en_p_vfb):
+            target_bits |= 0x10
+
+        for mat_id in range(16):
+            if 4 <= int(mat_id) <= 7:
+                continue
+            dev = self.matid_to_devaddr(mat_id)
+            try:
+                old = self.i2c_read_byte(dev, MatRegs.CAL_CONF)
+            except Ignite64TransportError:
+                continue
+            want = int(target_bits) if mat_id == int(block) else 0x00
+            new = _update_masked_byte(old, mask=mask, value=want)
             try:
                 self.i2c_write_byte(dev, MatRegs.CAL_CONF, new)
             except Ignite64TransportError:
@@ -637,9 +734,20 @@ class Ignite64(Ignite64LowLevel):
         code = (raw[0] << 8) | raw[1]
 
         # C# scaling constant array2 = [1.0, 0.25, 0.0625] and then /2^gain
-        lsb_v = [1.0, 0.25, 0.0625][res_idx]
-        value = float(code) * lsb_v / (2.0 ** float(gain))
-        return {"dev": dev, "cfg": cfg, "code": code, "value": value, "raw": raw}
+        # In the original GUI these coefficients are in mV/LSB, so the computed value is in mV.
+        lsb_mv = [1.0, 0.25, 0.0625][res_idx]
+        value_mv = float(code) * lsb_mv / (2.0 ** float(gain))
+        value_v = value_mv / 1000.0
+        # Keep backward compatibility: "value" is returned in Volts (common expectation in Python code),
+        # while "value_mv" exposes the raw C#-equivalent millivolt scaling.
+        return {
+            "dev": dev,
+            "cfg": cfg,
+            "code": code,
+            "value": value_v,
+            "value_mv": value_mv,
+            "raw": raw,
+        }
 
     def measureVDDA(self, quad: str, *, block: int) -> float:
         """
@@ -740,16 +848,17 @@ class Ignite64(Ignite64LowLevel):
             "krum": b69 & 0x0F,
         }
 
-    def AnalogSetIREF(self, valore_mv: float) -> None:
+    def AnalogSetIREF(self, valore_mv: float, *, vdda_mv: float = 1200.0) -> None:
         """
         Write external IREF DAC (C# "Write Iref").
 
         Raw I2C write to dev 0x20:
           [0x31, code_hi, code_lo]
 
-        Code computation matches C# (scaled to VDDA). Here we assume VDDA=1200 mV.
+        Code computation matches C# (scaled to VDDA).
+        Pass the current measured VDDA (mV) if available; default is 1200 mV.
         """
-        vdda_mv = 1200.0
+        vdda_mv = float(vdda_mv)
         v = float(valore_mv)
         if v < 0:
             raise ValueError("IREF must be >= 0 mV")
@@ -784,12 +893,23 @@ class Ignite64(Ignite64LowLevel):
         Returns selected USBtoI2C serial number.
         """
         # 0) USB bring-up (skip I2C_SetFrequency + GPIO init: they trigger popups on some setups)
+        import os as _os
+
+        def _env_truthy(name: str, default: str = "0") -> bool:
+            v = _os.environ.get(name, default).strip().lower()
+            return v not in {"0", "false", "no", "off", ""}
+
+        # Optional recovery knobs for stubborn I2C/IOext bring-up.
+        # Keep OFF by default to preserve original behavior.
+        do_gpio_init = _env_truthy("IGNITE64_STARTCFG_DO_GPIO_INIT", "0")
+        do_bus_recovery = _env_truthy("IGNITE64_STARTCFG_DO_BUS_RECOVERY", "0")
+
         selected_serial = self.init_sandrobox_usb(
             preferred_serial=preferred_serial,
             i2c_frequency_hz=None,
-            do_gpio_init=False,
+            do_gpio_init=do_gpio_init,
             do_ioext_init=False,
-            do_bus_recovery=False,
+            do_bus_recovery=do_bus_recovery,
             retry_enumeration=bool(retry_enumeration),
         )
         print(f"USB serial: {selected_serial}")
@@ -799,8 +919,20 @@ class Ignite64(Ignite64LowLevel):
             cfg_base = Path(__file__).resolve().parents[1] / "ConfigurationFiles"
         else:
             cfg_base = Path(cfg_dir)
-        full_cfg_path = cfg_base / full_cfg
-        si5340_cfg_path = cfg_base / si5340_cfg
+
+        def _resolve_cfg_path(base: Path, p: Union[str, Path]) -> Path:
+            """
+            Accept either:
+            - a filename within ConfigurationFiles/
+            - a relative/absolute path
+            """
+            pp = Path(str(p))
+            if pp.is_absolute() or len(pp.parts) > 1:
+                return pp
+            return base / pp
+
+        full_cfg_path = _resolve_cfg_path(cfg_base, full_cfg)
+        si5340_cfg_path = _resolve_cfg_path(cfg_base, si5340_cfg)
 
         if not full_cfg_path.exists():
             raise FileNotFoundError(f"Missing full configuration file: {full_cfg_path}")
@@ -841,8 +973,113 @@ class Ignite64(Ignite64LowLevel):
             print(f"TOP addr: 0x{self.addr.top_addr:02X}")
             self._write_block_bytewise(self.addr.top_addr, 0, cfg.top)
             for mat_id, data in sorted(cfg.mats.items()):
+                # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+                # Keep them in default state; configuration must be applied via broadcast (CalibDCO47 path).
+                if 4 <= int(mat_id) <= 7:
+                    print(f"[WARN] start_config: skipping MAT {mat_id} direct write (known I2C stack issue; use broadcast)")
+                    continue
                 dev = self.matid_to_devaddr(mat_id)
                 self._write_block_bytewise(dev, 0, data)
+
+        return int(selected_serial)
+
+    def init_hw(
+        self,
+        quadrant: str,
+        *,
+        preferred_serial: Optional[int] = 5284,
+        retry_enumeration: bool = True,
+        cfg_dir: Optional[Union[str, Path]] = None,
+        full_cfg: Optional[Union[str, Path]] = None,
+        si5340_cfg: str = "Si5340-RevD_Crystal-Registers_bis.txt",
+        apply_ioext_regs: Optional[list[int]] = None,
+        mux_settle_s: float = 0.05,
+        do_ioext_defaults: bool = True,
+        do_clock: bool = True,
+        do_unlock_top_dc: bool = True,
+    ) -> int:
+        """
+        Bring-up only (NO configuration writes):
+        USB select -> (optional) IOext defaults -> (optional) clock -> select quadrant and unlock TOP default config.
+
+        This is meant for GUI "read-only / preserve chip state" startup (START_CONFIG=auto).
+        Returns selected USBtoI2C serial number.
+        """
+        import os as _os
+
+        def _env_truthy(name: str, default: str = "0") -> bool:
+            v = _os.environ.get(name, default).strip().lower()
+            return v not in {"0", "false", "no", "off", ""}
+
+        do_gpio_init = _env_truthy("IGNITE64_STARTCFG_DO_GPIO_INIT", "0")
+        do_bus_recovery = _env_truthy("IGNITE64_STARTCFG_DO_BUS_RECOVERY", "0")
+
+        selected_serial = self.init_sandrobox_usb(
+            preferred_serial=preferred_serial,
+            i2c_frequency_hz=None,
+            do_gpio_init=do_gpio_init,
+            do_ioext_init=False,
+            do_bus_recovery=do_bus_recovery,
+            retry_enumeration=bool(retry_enumeration),
+        )
+        print(f"USB serial: {selected_serial}")
+
+        # Resolve config base for SI5340 file
+        if cfg_dir is None:
+            cfg_base = Path(__file__).resolve().parents[1] / "ConfigurationFiles"
+        else:
+            cfg_base = Path(cfg_dir)
+
+        def _resolve_cfg_path(base: Path, p: Union[str, Path]) -> Path:
+            pp = Path(str(p))
+            if pp.is_absolute() or len(pp.parts) > 1:
+                return pp
+            return base / pp
+
+        si5340_cfg_path = _resolve_cfg_path(cfg_base, si5340_cfg)
+        if do_clock and (not si5340_cfg_path.exists()):
+            raise FileNotFoundError(f"Missing SI5340 configuration file: {si5340_cfg_path}")
+
+        if do_ioext_defaults:
+            self.ioext_init_defaults()
+            print(f"IOext addr: 0x{self.addr.ioext_addr:02X}")
+
+            # Optionally apply key IOext regs from a full configuration file (mirrors start_config()).
+            try:
+                if apply_ioext_regs is None:
+                    apply_ioext_regs = [9, 10]
+                if full_cfg and apply_ioext_regs:
+                    # Resolve full_cfg path (accept filename under ConfigurationFiles/ or absolute/relative)
+                    full_cfg_path = _resolve_cfg_path(cfg_base, full_cfg)
+                    if full_cfg_path.exists():
+                        cfg = parse_full_configuration(str(full_cfg_path))
+                        dev = self.addr.ioext_addr
+                        for r in apply_ioext_regs:
+                            r = int(r)
+                            if r < 0 or r >= len(cfg.ioext):
+                                continue
+                            self.i2c_write_byte(dev, r, int(cfg.ioext[r]) & 0xFF)
+            except Exception:
+                pass
+
+        if do_clock:
+            self.loadClockSetting(str(si5340_cfg_path))
+            print("SI5340: configured")
+
+        q = quadrant.strip().upper()
+        if q == "ALL":
+            quads = ["SW", "NW", "SE", "NE"]
+        else:
+            quads = [q]
+
+        for qq in quads:
+            self.select_quadrant(qq)
+            time.sleep(max(0.0, float(mux_settle_s)))
+            print(f"Mux addr: 0x{self.addr.mux_addr:02X} (quad={qq})")
+            if do_unlock_top_dc:
+                # Be a bit more patient here: TOP may need extra time after mux/clock/IOext changes.
+                self.unlock_top_default_config(retries=8, delay_s=0.12)
+            print(f"TOP addr: 0x{self.addr.top_addr:02X}")
 
         return int(selected_serial)
 
@@ -920,12 +1157,44 @@ class Ignite64(Ignite64LowLevel):
         new = _update_masked_byte(old, mask=mask, value=(0x40 if on else 0x00))
         self.i2c_write_byte(dev, reg, new)
 
+    def _pix_set_feon(self, mat_id: int, pix_id: int, *, on: bool) -> None:
+        """
+        Set FE_ON / ENPOW bit (bit7) for a given pixel register.
+        In the C# GUI this is the "FE on" checkbox (distinct from PIXON).
+        """
+        if pix_id < 0 or pix_id > 63:
+            raise ValueError(f"pix_id out of range: {pix_id} (expected 0..63)")
+        dev = self.matid_to_devaddr(mat_id)
+        reg = pix_id
+        old = self.i2c_read_byte(dev, reg)
+        mask = 0x80
+        new = _update_masked_byte(old, mask=mask, value=(0x80 if on else 0x00))
+        self.i2c_write_byte(dev, reg, new)
+
     def readAnalogENPOW(self, quad: str, *, mattonella: int, canale: int) -> bool:
         """
         Lettura dello stato ON/OFF del canale/pixel (bit PIXON).
         """
         self.select_quadrant(quad)
         return self.readAnalogChannelON(quad, mattonella=mattonella, canale=canale)
+
+    def readAnalogFEON(self, quad: str, *, mattonella: int, canale: int) -> bool:
+        """
+        Read FE_ON / ENPOW state for a pixel (bit7 of per-pixel register).
+        """
+        self.select_quadrant(quad)
+        if canale < 0 or canale > 63:
+            raise ValueError(f"pix_id out of range: {canale} (expected 0..63)")
+        dev = self.matid_to_devaddr(mattonella)
+        b = self.i2c_read_byte(dev, int(canale))
+        return (int(b) & 0x80) != 0
+
+    def setAnalogFEON(self, quad: str, *, mattonella: int, canale: int, on: bool) -> None:
+        """
+        Set FE_ON / ENPOW for a pixel (bit7), without changing PIXON (bit6).
+        """
+        self.select_quadrant(quad)
+        self._pix_set_feon(int(mattonella), int(canale), on=bool(on))
 
     def readAnalogChannelON(self, quad: str, *, mattonella: int, canale: int) -> bool:
         self.select_quadrant(quad)
@@ -941,13 +1210,16 @@ class Ignite64(Ignite64LowLevel):
         Stato Analog Power come nel C# (`IOext_gpio_refresh`):
         IOext reg 10 (dev 0x40), bit6 è invertito: Analog ON quando bit6 == 0.
         """
-        # IOext address can be 0x40 or 0xAE; autodetect once if needed
+        # C# non autodetecta ad ogni click: usa l'indirizzo già noto (ioext_addr).
+        dev = int(self.addr.ioext_addr) & 0xFF
         try:
-            self.autodetect_ioext_address()
+            b = self.i2c_read_byte(dev, 10)
         except Exception:
-            pass
-        b = self.i2c_read_byte(self.addr.ioext_addr, 10)
-        return ((b >> 6) & 1) != 1
+            # Best-effort: autodetect solo se la lettura diretta fallisce.
+            self.autodetect_ioext_address()
+            dev = int(self.addr.ioext_addr) & 0xFF
+            b = self.i2c_read_byte(dev, 10)
+        return ((int(b) >> 6) & 1) != 1
 
     def setAnalogPower(self, on: bool) -> None:
         """
@@ -957,13 +1229,14 @@ class Ignite64(Ignite64LowLevel):
           - AnaPwr_chkBox.Checked = ((num >> 6) & 1) != 1
           - quindi Analog Power ON quando bit6 == 0
         """
+        dev = int(self.addr.ioext_addr) & 0xFF
         try:
-            self.autodetect_ioext_address()
+            b = int(self.i2c_read_byte(dev, 10)) & 0xFF
         except Exception:
-            # Best-effort: if autodetect fails, we still try current addr.ioext_addr.
-            pass
-        dev = int(self.addr.ioext_addr)
-        b = int(self.i2c_read_byte(dev, 10)) & 0xFF
+            # Best-effort: autodetect solo se la lettura diretta fallisce.
+            self.autodetect_ioext_address()
+            dev = int(self.addr.ioext_addr) & 0xFF
+            b = int(self.i2c_read_byte(dev, 10)) & 0xFF
         if on:
             # clear bit6
             new = b & ~(1 << 6)
@@ -1119,29 +1392,58 @@ class Ignite64(Ignite64LowLevel):
 
         self.i2c_write_byte(dev, reg, new)
 
-    def readMatPixelsAndFTDAC(self, quad: str, *, mattonella: int) -> dict[str, list[int] | list[bool]]:
+    def readAnalogChannelFineTune(self, quad: str, *, mattonella: int, canale: int) -> int:
+        """
+        Read FineTune DAC code (0..15) for a single pixel channel.
+        C# mapping (`MAT_DACset_refresh`): reg = 76 + pix//2, nibble low for even, high for odd.
+        """
+        self.select_quadrant(quad)
+        if canale < 0 or canale > 63:
+            raise ValueError(f"pix_id out of range: {canale} (expected 0..63)")
+        m = int(mattonella)
+        if m < 0 or m > 15:
+            raise ValueError("mattonella out of range (expected 0..15)")
+        dev = self.matid_to_devaddr(m)
+        reg = MatRegs.FT_BASE + (int(canale) // 2)
+        b = int(self.i2c_read_byte(dev, reg)) & 0xFF
+        if int(canale) % 2 == 0:
+            return b & 0x0F
+        return (b >> 4) & 0x0F
+
+    def readMatPixelsAndFTDAC(
+        self,
+        quad: str,
+        *,
+        mattonella: int,
+        _skip_select_quadrant: bool = False,
+        _skip_topreadout: bool = False,
+    ) -> dict[str, list[int] | list[bool]]:
         """
         Efficient readout for GUI monitoring.
 
         Returns:
           - pix_on: list[bool] length 64 (PIXON bit6 in regs 0..63)
+          - fe_on:  list[bool] length 64 (FEON bit7 in regs 0..63)
           - ftdac:  list[int]  length 64 (FineTune DAC code 0..15 from regs 76..107)
         """
-        self.select_quadrant(quad)
+        if not _skip_select_quadrant:
+            self.select_quadrant(quad)
         m = int(mattonella)
         if m < 0 or m > 15:
             raise ValueError("mattonella out of range (expected 0..15)")
         # Some configuration snapshots may leave TOP readout interface not in I2C.
         # The GUI expects I2C-accessible MAT registers to be read back correctly.
-        try:
-            self.TopReadout("i2c")
-        except Exception:
-            pass
+        if not _skip_topreadout:
+            try:
+                self.TopReadout("i2c")
+            except Exception:
+                pass
         dev = self.matid_to_devaddr(m)
 
         # Pixel regs 0..63: bit6 is PIXON
         pix_bytes = self.i2c_read_bytes(dev, 0x00, 64)
         pix_on = [((b & 0x40) != 0) for b in pix_bytes]
+        fe_on = [((b & 0x80) != 0) for b in pix_bytes]
 
         # FineTune regs 76..107 inclusive: 32 bytes, 2 pixels per byte
         ft_bytes = self.i2c_read_bytes(dev, int(MatRegs.FT_BASE), 32)
@@ -1150,7 +1452,7 @@ class Ignite64(Ignite64LowLevel):
             ftdac[2 * i] = bb & 0x0F
             ftdac[2 * i + 1] = (bb >> 4) & 0x0F
 
-        return {"pix_on": pix_on, "ftdac": ftdac}
+        return {"pix_on": pix_on, "fe_on": fe_on, "ftdac": ftdac}
 
     # ---------------------------
     # TOP: StartTP (reg 11 bit6)

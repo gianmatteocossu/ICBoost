@@ -58,8 +58,18 @@ from icboost.gui_tk import run_gui
 
 
 if __name__ == "__main__":
-    # START_CONFIG=0 skips hw.start_config even when OFFLINE=0 (optional).
-    start_config = os.environ.get("START_CONFIG", "1").strip() not in {"0", "false", "no", "off", ""}
+    # START_CONFIG:
+    # - 0/false/no/off  -> skip hw.start_config (read-only mode)
+    # - 1/true          -> always run hw.start_config (writes config)
+    # - auto            -> try to detect if chip is already configured; if yes, do read-only refresh
+    # Default to AUTO to preserve current chip state unless explicitly requested.
+    _sc_raw = os.environ.get("START_CONFIG", "auto").strip().lower()
+    print(f"[gui_monitor] START_CONFIG env={os.environ.get('START_CONFIG', '')!r} parsed={_sc_raw!r}", flush=True)
+    if _sc_raw in {"auto"}:
+        start_config = "auto"
+    else:
+        start_config = _sc_raw not in {"0", "false", "no", "off", ""}
+    print(f"[gui_monitor] start_config arg -> {start_config!r}", flush=True)
     base_cfg = os.environ.get("BASE_CONFIG_FILE", "").strip() or None
     si_cfg = os.environ.get("SI5340_CONFIG_FILE", "").strip() or None
     run_gui(

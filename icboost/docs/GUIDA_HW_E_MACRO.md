@@ -24,6 +24,7 @@ Documento di riferimento per operatori che usano **icboost** da script, barra **
    - [5.9 Snapshot e caricamento file](#59-snapshot-e-caricamento-file)
    - [5.10 Calibrazione DCO](#510-calibrazione-dco)
    - [5.11 Avvio `start_config`](#511-avvio-start_config)
+   - [5.12 GUI Tk (monitor)](#512-gui-tk-monitor)
 6. [Libreria `macros_library` (builtin)](#6-libreria-macro_library-builtin)
 7. [Script in `examples/macros/`](#7-script-in-examplesmacros)
 8. [Esempi pratici (frammenti)](#8-esempi-pratici-frammenti)
@@ -36,6 +37,7 @@ Documento di riferimento per operatori che usano **icboost** da script, barra **
 
 - Le **macro** in `examples/macros/` sono implementazioni che chiamano API testate; **non sostituiscono** il giudizio dell’operatore su ordine delle operazioni, limiti di corrente e stato del banco.
 - **FIFO / calibrazione FTDAC**: richiedono di norma `TopReadout("i2c")`, mux sul quadrante corretto e pixel/TDC configurati come da procedura; la macro `prepare_fifo_readout` imposta readout I2C + `select_quadrant`.
+- **MAT 4..7 (nota bus)**: su alcuni banchi l’indirizzamento I2C **diretto** verso MAT 4–7 può “stackare” il bus; in **icboost** le scritture MAT in `start_config` saltano 4–7 e molte azioni GUI su “tutto il quadrante” usano **broadcast** (dev 254) con lettura di verifica su MAT0. Le calibrazioni per-canale che richiedono accesso MAT-specifico possono essere limitate su quelle MAT.
 - **`AnalogChannelON` / `EnableDigPix`** con gli stessi indici agiscono sul **bit PIXON** del registro pixel (stesso percorso fisico); il nome cambia in base allo stile della API C# originale.
 
 ---
@@ -83,6 +85,7 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 | Metodo | Significato |
 |--------|-------------|
 | `FifoReadSingle() -> int` | Una parola 64 bit; `0` se FIFO vuota (rc vendor 3). |
+| `FifoReadSingleRobust(..., quad=?, retries=?, backoff_s=?, do_bus_recovery=?, ensure_i2c_readout=?) -> int` | Come `FifoReadSingle`, con **retry** e tentativo di **bus recovery**; utile in loop di calibrazione quando il bridge restituisce errori transitori (es. `rc=1`). |
 | `FifoReadNumWords(n_words: 1..24) -> list[int]` | Burst di parole. |
 | `FifoDrain(max_words=4096) -> list[int]` | Svuota fino a vuoto o limite. |
 
@@ -128,7 +131,7 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 | Metodo | Significato |
 |--------|-------------|
 | `AnalogChannelFineTune(quad, block=, mattonella=, canale=, valore=)` | Codice 0..15 per pixel. |
-| `readMatPixelsAndFTDAC(quad, mattonella=) -> dict` | Chiavi `pix_on` (64 bool), `ftdac` (64 int). |
+| `readMatPixelsAndFTDAC(quad, mattonella=) -> dict` | Chiavi `pix_on` (64 bool), `fe_on` (64 bool, FE enable), `ftdac` (64 int). |
 
 ### 5.6 Calibrazione FTDAC
 
@@ -175,6 +178,18 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 ### 5.11 Avvio `start_config`
 
 `start_config(quadrant, ...)` esegue sequenza: USB, IOext, clock SI5340, scrittura TOP+MAT da file in `ConfigurationFiles/`. Parametri opzionali: percorsi file, registri IOext, tempo stabilizzazione mux. Vedere docstring in `api.py`.
+
+**Bring-up senza riscrivere TOP/MAT**: `init_hw(quadrant, ...)` seleziona USB, opzionalmente applica default IOext + clock SI5340, seleziona il quadrante e sblocca TOP, **senza** caricare la configurazione completa dal file. È pensato per avvio GUI in modalità “preserva stato chip” (`START_CONFIG=auto` in `examples/gui_monitor.py`).
+
+### 5.12 GUI Tk (monitor)
+
+Panoramica funzioni aggiunte rispetto alla sola navigazione menu (dettaglio variabili d’ambiente in **[INSTALLAZIONE_WINDOWS.md](INSTALLAZIONE_WINDOWS.md)**):
+
+- **FIFO**: pannello con decodifica parola, drain, letture robuste durante calibrazione; attenzione a hit “stale” — le routine GUI filtrano spesso per MAT/canale atteso.
+- **Calibrazione FTDAC**: da popup pixel (**Calibra canale…**) e da vista blocco (**Calibra canali…** per sweep MAT); riprende **Start MAT / Start CH** e interrompe in caso di errori DLL/trasporto gravi.
+- **Check Calibration**: campionamento burst + statistiche canali rumorosi; azione **Turn OFF offending channels** (PIX/FE/TDC come da implementazione corrente) quando serve ripulire dopo calibrazione.
+- **Reconnect USB**: recovery best-effort dopo errori tipo `WDU_Transfer` (bus recovery + `init_hw()` senza riscrittura TOP/MAT).
+- **Quadrant “ALL” / broadcast**: per MAT 4–7 e operazioni su intero quadrante, preferire i percorsi GUI che usano broadcast invece di I2C diretto per MAT.
 
 ---
 

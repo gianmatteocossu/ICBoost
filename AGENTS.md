@@ -16,7 +16,7 @@ La cartella progetto si chiama in genere **`icboost/`** (contiene `pyproject.tom
 | `<cartella-progetto>/icboost/device.py` | I2C, `select_quadrant`, trasporto DLL. |
 | `<cartella-progetto>/icboost/gui_tk.py` | GUI monitor; `run_gui()` avvio; navigazione Quadrants / blocchi / analog. |
 | `<cartella-progetto>/icboost/macros_library.py` | Funzioni `builtin_*` usate dalle macro GUI. |
-| `<cartella-progetto>/examples/gui_monitor.py` | Entrypoint GUI tipico (`OFFLINE` default 1). |
+| `<cartella-progetto>/examples/gui_monitor.py` | Entrypoint GUI tipico (`OFFLINE` default 1; `START_CONFIG` default **auto** = `init_hw` senza riscrivere TOP/MAT). |
 | `<cartella-progetto>/examples/macros/*.py` | Macro `source nome.py` dalla GUI. |
 | `<cartella-progetto>/docs/GUIDA_HW_E_MACRO.md` | Riferimento API e macro (dettagliato). |
 | `<cartella-progetto>/docs/INSTALLAZIONE_WINDOWS.md` | Setup Python, Pillow, DLL, variabili ambiente. |

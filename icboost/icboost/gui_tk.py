@@ -4,6 +4,7 @@ import io
 import os
 import pkgutil
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import ttk, filedialog
@@ -312,6 +313,18 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     v = os.environ.get(name, default).strip().lower()
     return v not in {"0", "false", "no", "off", ""}
 
+
+def _dbg(msg: str) -> None:
+    # Debug via env var; default ON to make the requested messages visible.
+    if not _env_truthy("ICBOOST_GUI_DEBUG", "1"):
+        return
+    try:
+        ts = time.strftime("%H:%M:%S")
+    except Exception:
+        ts = ""
+    print(f"[icboost-gui {ts}] {msg}", flush=True)
+
+
 def _maybe_load_pil():
     try:
         from PIL import Image, ImageTk  # type: ignore
@@ -434,8 +447,24 @@ class Ignite64Gui(tk.Tk):
         # dopo la configurazione di base all'apertura GUI.
         self._mat_snapshot_cache: dict[str, dict[int, dict[str, object]]] = {q: {} for q in ("NW", "NE", "SW", "SE")}
         self._mat_snapshot_prefill_active: bool = False
+        self._mat_snapshot_prefill_from_file: bool = False
+        self._snapshot_capture_in_progress: bool = False
         self._analog_power_btn: Optional[tk.Button] = None
+        self._mat_snapshot_disable_after_id: Optional[str] = None
+        # External IREF DAC is write-only; keep last value set for UI "Read" (C# NumericUpDown behavior).
+        try:
+            _iref0 = float(os.environ.get("IGNITE64_IREF_MV", "900").strip())
+        except Exception:
+            _iref0 = 900.0
+        self._iref_last_mv_by_quad: dict[str, float] = {q: float(_iref0) for q in ("SW", "NW", "SE", "NE")}
+        self._iref_var = tk.StringVar(value=f"{float(_iref0):.6g}")
+        self._iref_meas_var = tk.StringVar(value="")
+        # Quadrant overview: persist ALL toggles and allow forced HW refresh.
+        self._quad_all_vars: dict[str, dict[str, tk.BooleanVar]] = {}
+        self._blocks_view_refresh_cb: Optional[object] = None
+        self._blocks_view_force_hw: bool = False
 
+        # --- UI scaffold (must be created during __init__) ---
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
 
@@ -461,7 +490,7 @@ class Ignite64Gui(tk.Tk):
 
         ttk.Separator(topbar, orient="vertical").pack(side="left", fill="y", padx=8)
 
-        # Cmd + Macro: due righe, colonna centrale larga; Calib DCO solo in alto a destra (no testo lungo qui)
+        # Cmd + Macro: due righe, colonna centrale larga; Calib DCO solo in alto a destra
         cmd_macro = ttk.Frame(topbar)
         cmd_macro.pack(side="left", fill="both", expand=True, padx=(0, 12))
         cmd_macro.columnconfigure(1, weight=1, minsize=480)
@@ -475,11 +504,14 @@ class Ignite64Gui(tk.Tk):
         ttk.Label(cmd_macro, text="Macro:").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=(6, 0))
         self._macro_file_cb = ttk.Combobox(cmd_macro, state="readonly", width=70)
         self._macro_file_cb.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        ttk.Button(cmd_macro, text="Source", command=self._run_macro_source_button).grid(row=1, column=2, padx=(8, 0), pady=(6, 0))
+        ttk.Button(cmd_macro, text="Source", command=self._run_macro_source_button).grid(
+            row=1, column=2, padx=(8, 0), pady=(6, 0)
+        )
 
         self._refresh_macro_file_list()
         self._macro_file_cb.bind("<<ComboboxSelected>>", self._on_macro_file_selected)
 
+        ttk.Button(topbar, text="Reconnect USB", command=self._reconnect_usb).pack(side="right", padx=(0, 4))
         ttk.Button(topbar, text="Calib DCO…", command=self._calib_dco_dialog).pack(side="right", padx=(4, 0))
 
         self.content = ttk.Frame(root)
@@ -487,7 +519,225 @@ class Ignite64Gui(tk.Tk):
 
         self.quad_var.trace_add("write", lambda *_a: self.after_idle(self._touch_quadrants_top_mon_from_trace))
 
+        # Show home immediately (so the window is never blank)
         self.nav_home()
+
+    def _reconnect_usb(self) -> None:
+        """
+        Best-effort recovery for WDU_Transfer / USB transport wedging.
+        Stops FIFO auto loops, runs bus recovery, then re-initializes HW bring-up without rewriting config.
+        """
+        if self.offline:
+            self._set_status("Reconnect USB: offline")
+            return
+
+        self._fifo_auto_stop()
+        q = str(self.quad_var.get()).strip().upper()
+
+        def work() -> None:
+            try:
+                try:
+                    self.hw.i2c_bus_recovery()
+                except Exception:
+                    pass
+                base_cfg = os.environ.get("BASE_CONFIG_FILE", "").strip() or None
+                si_cfg = os.environ.get("SI5340_CONFIG_FILE", "").strip() or None
+                self.hw.init_hw(
+                    q,
+                    full_cfg=base_cfg,
+                    si5340_cfg=str(si_cfg or "Si5340-RevD_Crystal-Registers_bis.txt"),
+                )
+                self.after(0, lambda: self._set_status(f"Reconnect USB: OK (Q={q})"))
+            except Exception as e:
+                self.after(0, lambda e=e: self._set_status(f"Reconnect USB error: {e}"))
+
+        self._set_status("Reconnect USB: running…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _start_initial_snapshot_prefill(self, default_quad: str, base_config_file: Optional[str]) -> None:
+        """
+        Kick off the initial "snapshot" prefill without blocking GUI startup.
+
+        Note: this is scheduled via `after()` from `run_gui()` so the mainloop is already running
+        and Windows won't show a blank/unresponsive window while we do I2C operations.
+        """
+        if self.offline:
+            return
+
+        qkey = str(default_quad).strip().upper()
+
+        def do_file() -> int:
+            cached_mats = 0
+            cfg_base = Path(__file__).resolve().parents[1] / "ConfigurationFiles"
+            default_full_cfg_name = "IGNITE64_configSW_26.04.29.12.31.45.txt"
+
+            # base_config_file can be either:
+            # - a filename inside ConfigurationFiles/
+            # - an absolute/relative path
+            if base_config_file:
+                p = Path(str(base_config_file))
+                full_cfg_path = p if (p.is_absolute() or len(p.parts) > 1) else (cfg_base / p)
+            else:
+                # Pick newest config file if present, else fall back to a known default name.
+                candidates = sorted(
+                    cfg_base.glob("IGNITE64_configSW_*.txt"),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True,
+                )
+                full_cfg_path = candidates[0] if candidates else (cfg_base / default_full_cfg_name)
+
+            # Assicura TOP[0]=DC per spegnere il default config (C# usa questo flag in GUI).
+            self.hw.unlock_top_default_config(retries=5, delay_s=0.1)
+            try:
+                self.hw.TopReadout("i2c")
+            except Exception:
+                pass
+
+            cached_mats = self._prefill_mat_snapshot_from_full_configuration_file(full_cfg_path, qkey)
+            return int(cached_mats)
+
+        def on_done_file(cm: int) -> None:
+            try:
+                cm = int(cm)
+            except Exception:
+                cm = 0
+            self._mat_snapshot_prefill_active = True
+            self._mat_snapshot_prefill_from_file = True
+            self._snapshot_capture_in_progress = False
+            _dbg(
+                f"snapshot created (quando ri scarichi la mappa di tutti i registri nuovamente) (file-prefill) "
+                f"(quad={qkey}) cached_mats={cm}/16"
+            )
+
+        def do_hw() -> int:
+            return int(self._capture_mat_snapshot(qkey))
+
+        def on_done_hw(cm: int) -> None:
+            try:
+                cm = int(cm)
+            except Exception:
+                cm = 0
+            self._mat_snapshot_prefill_active = True
+            self._mat_snapshot_prefill_from_file = False
+            self._snapshot_capture_in_progress = False
+            _dbg(
+                f"snapshot created (quando ri scarichi la mappa di tutti i registri nuovamente) (hw) "
+                f"(quad={qkey}) cached_mats={cm}/16"
+            )
+
+        def on_fail_file(err: Exception) -> None:
+            _dbg(f"file-prefill snapshot failed: {err!r}; fallback to hw snapshot")
+            self._set_status(f"Snapshot prefill fallback (hw) (Q={qkey})")
+
+            def work_hw() -> None:
+                try:
+                    cm = int(do_hw())
+                except Exception as e:
+                    self.after(0, lambda e=e: self._set_status(f"Snapshot prefill (hw) error: {e}"))
+                    return
+                self.after(0, lambda cm=cm: on_done_hw(cm))
+            threading.Thread(target=work_hw, daemon=True).start()
+
+        self._snapshot_capture_in_progress = True
+        self._set_status(f"Snapshot prefill (file) (Q={qkey})")
+
+        def work_file() -> None:
+            try:
+                cm = int(do_file())
+            except Exception as e:
+                self.after(0, lambda e=e: on_fail_file(e))
+                return
+            self.after(0, lambda cm=cm: on_done_file(cm))
+
+        threading.Thread(target=work_file, daemon=True).start()
+
+    def _start_initial_snapshot_refresh_from_hw(self, default_quad: str) -> None:
+        """
+        Read current HW state (snapshot) in background to reflect the *actual* chip state
+        without rewriting configuration.
+        """
+        if self.offline:
+            return
+        qkey = str(default_quad).strip().upper()
+        self._snapshot_capture_in_progress = True
+        self._set_status(f"Snapshot refresh (HW) (Q={qkey})")
+
+        def work() -> None:
+            try:
+                cm = int(self._capture_mat_snapshot(qkey))
+            except Exception as e:
+                self.after(0, lambda e=e: self._set_status(f"Snapshot refresh (HW) error: {e}"))
+                return
+
+            def done() -> None:
+                self._mat_snapshot_prefill_active = True
+                self._mat_snapshot_prefill_from_file = False
+                self._snapshot_capture_in_progress = False
+                _dbg(
+                    f"snapshot created (quando ri scarichi la mappa di tutti i registri nuovamente) (hw-refresh) "
+                    f"(quad={qkey}) cached_mats={int(cm)}/16"
+                )
+
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _quadrant_full_refresh(self, quad: str) -> None:
+        """
+        Refresh snapshot cache for the given quadrant by reading all MAT registers needed by the
+        Quadrant→Blocks view: PIXON (bit6), FEON (bit7), and FTDAC (regs 76..107).
+
+        Known limitation: MAT 4..7 cannot be addressed individually (I2C stack issue). For those MATs
+        we do not read HW; we keep / synthesize state based on the last quadrant-wide ALL toggles.
+        """
+        q = str(quad).strip().upper()
+
+        def do() -> None:
+            self.hw.select_quadrant(q)
+            qc = self._mat_snapshot_cache.setdefault(q, {})
+            for mid in range(16):
+                if 4 <= int(mid) <= 7:
+                    # Best-effort: represent 4..7 using last known quadrant-wide ALL state.
+                    ent = qc.get(int(mid))
+                    if not isinstance(ent, dict):
+                        ent = {}
+                        qc[int(mid)] = ent
+                    po = ent.get("pix_on")
+                    fo = ent.get("fe_on")
+                    if not isinstance(po, list) or len(po) < 64:
+                        po = [False] * 64
+                    if not isinstance(fo, list) or len(fo) < 64:
+                        fo = [True] * 64
+                    v = self._quad_all_vars.get(q, {})
+                    try:
+                        if "px" in v and isinstance(v["px"], tk.BooleanVar):
+                            po = [bool(v["px"].get())] * 64
+                    except Exception:
+                        pass
+                    try:
+                        if "fe" in v and isinstance(v["fe"], tk.BooleanVar):
+                            fo = [bool(v["fe"].get())] * 64
+                    except Exception:
+                        pass
+                    ent["pix_on"] = po
+                    ent["fe_on"] = fo
+                    continue
+
+                r = self.hw.readMatPixelsAndFTDAC(q, mattonella=int(mid))
+                if isinstance(r, dict):
+                    qc[int(mid)] = r
+
+        self._with_hw(do, busy=f"Refresh quadrant snapshot (Q={q})")
+        # Enable cache usage for immediate redraw.
+        self._mat_snapshot_prefill_active = True
+        self._mat_snapshot_prefill_from_file = False
+        # If Blocks view is open, force redraw after cache refresh.
+        try:
+            cb = self._blocks_view_refresh_cb
+            if cb:
+                self.after(0, cb)  # type: ignore[misc]
+        except Exception:
+            pass
 
     def _iter_die_photo_asset_dirs(self) -> list[Path]:
         """Directories that may contain die photos (order matters)."""
@@ -917,26 +1167,50 @@ class Ignite64Gui(tk.Tk):
             self._set_status(busy)
             return fn()
         except Exception as e:
+            _dbg(f"HW call failed busy={busy} err={e!r}")
             self._set_status(f"Error: {e}")
             return None
         finally:
             self.update_idletasks()
 
-    def _capture_mat_snapshot(self, quad: str) -> None:
+    def _capture_mat_snapshot(self, quad: str) -> int:
         """
         Lettura pre-caricata MAT (pix_on + ftdac) per una singola quadrant.
         Serve solo per mostrare subito lo stato corretto in UI dopo `hw.start_config`.
         """
         if self.offline:
-            return
+            return 0
+        # Snapshot "da hardware" invalida quello "da file".
+        self._mat_snapshot_prefill_from_file = False
         q = str(quad).strip().upper()
         if q not in self._mat_snapshot_cache:
-            return
+            return 0
+        t0 = time.perf_counter()
         # Reset cache per evitare dati vecchi.
         self._mat_snapshot_cache[q] = {}
+        cached_mats = 0
+
+        # Configure HW state once to avoid per-MAT overhead.
+        # readMatPixelsAndFTDAC() can skip selection/topreadout when this is already done.
+        try:
+            self.hw.select_quadrant(q)
+        except Exception:
+            pass
+        try:
+            self.hw.TopReadout("i2c")
+        except Exception:
+            pass
         for mat_id in range(16):
+            # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+            if 4 <= int(mat_id) <= 7:
+                continue
             try:
-                r = self.hw.readMatPixelsAndFTDAC(q, mattonella=mat_id)
+                r = self.hw.readMatPixelsAndFTDAC(
+                    q,
+                    mattonella=mat_id,
+                    _skip_select_quadrant=True,
+                    _skip_topreadout=True,
+                )
                 if not isinstance(r, dict):
                     continue
                 pix_on = r.get("pix_on")
@@ -948,9 +1222,57 @@ class Ignite64Gui(tk.Tk):
                     and len(ftdac) == 64
                 ):
                     self._mat_snapshot_cache[q][mat_id] = {"pix_on": pix_on, "ftdac": ftdac}
+                    cached_mats += 1
             except Exception:
                 # Best-effort: se una singola MAT fallisce, la UI la rileggerà al bisogno.
                 continue
+
+        dt = time.perf_counter() - t0
+        _dbg(
+            f"snapshot created (quando ri scarichi la mappa di tutti i registri nuovamente) (quad={q}) cached_mats={cached_mats}/16 in {dt:.3f}s"
+        )
+        return cached_mats
+
+    def _prefill_mat_snapshot_from_full_configuration_file(self, full_cfg_path: Path, quad: str) -> int:
+        """
+        Prefill della cache MAT/pix_on/ftdac *senza* leggere l'intero chip.
+        Serve a far sì che la GUI sia coerente con il file di configurazione C#.
+        """
+        if self.offline:
+            return 0
+
+        from .config import parse_full_configuration
+
+        q = str(quad).strip().upper()
+        if q not in self._mat_snapshot_cache:
+            return 0
+
+        cfg = parse_full_configuration(full_cfg_path)
+
+        # Cache reset
+        self._mat_snapshot_cache[q] = {}
+
+        cached_mats = 0
+        for mat_id in range(16):
+            data = cfg.mats.get(mat_id)
+            if not isinstance(data, list) or len(data) < 108:
+                continue
+
+            # MAT regs 0..63: pix regs; bit6 == PIXON
+            pix_bytes = [int(x) & 0xFF for x in data[0:64]]
+            pix_on = [((b & 0x40) != 0) for b in pix_bytes]
+
+            # MAT regs FT_BASE=76..107: 32 bytes, 2 pixel per byte => 64 nibbles
+            ft_bytes = [int(x) & 0xFF for x in data[76:108]]
+            ftdac: list[int] = [0] * 64
+            for i, bb in enumerate(ft_bytes):
+                ftdac[2 * i] = bb & 0x0F
+                ftdac[2 * i + 1] = (bb >> 4) & 0x0F
+
+            self._mat_snapshot_cache[q][mat_id] = {"pix_on": pix_on, "ftdac": ftdac}
+            cached_mats += 1
+
+        return cached_mats
 
     def _fifo_decode_word(self, w: int) -> dict[str, int]:
         """
@@ -999,6 +1321,253 @@ class Ignite64Gui(tk.Tk):
                 pass
             self._fifo_auto_after_id = None
 
+    def _check_calibration(self, quad: str) -> None:
+        """
+        Quadrant-level post-calibration helper:
+        - read/drain FIFO and identify channels (MAT, CH) still counting
+        - increment FTCODE by +1 only for those channels
+        - repeat until FIFO is quiet or safety limits reached
+
+        Note: MAT 4..7 cannot be addressed directly; they will be reported but not adjusted here.
+        """
+        if self.offline:
+            self._set_status("Check Calibration: offline")
+            return
+
+        q = str(quad).strip().upper()
+
+        win = tk.Toplevel(self)
+        win.title(f"Check Calibration — Q={q}")
+        win.transient(self)
+        win.resizable(True, True)
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill="both", expand=True)
+
+        status_var = tk.StringVar(value="—")
+        ttk.Label(root, textvariable=status_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+
+        stats_var = tk.StringVar(value="")
+        ttk.Label(root, textvariable=stats_var, font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 6))
+
+        out = tk.Text(root, height=18, width=92, wrap="none", state="disabled")
+        yscroll = ttk.Scrollbar(root, orient="vertical", command=out.yview)
+        out.configure(yscrollcommand=yscroll.set)
+        out.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        def log(msg: str) -> None:
+            try:
+                self._fifo_log(out, msg)
+            except Exception:
+                pass
+
+        last_active: set[tuple[int, int]] = set()
+        last_lock = threading.Lock()
+        adjusted_lock = threading.Lock()
+        adjusted_unique: set[tuple[int, int]] = set()
+
+        def turn_off_offending() -> None:
+            """
+            Turn OFF channels that were last seen counting in FIFO.
+            We can only disable per-channel PIXON/FEON; TDCON is MAT-level.
+            """
+            if self.offline:
+                return
+
+            def work_off() -> None:
+                try:
+                    with last_lock:
+                        offenders = sorted(list(last_active))
+                    if not offenders:
+                        self.after(0, lambda: log("No offenders captured yet (run at least 1 iteration)."))
+                        return
+                    self.after(0, lambda n=len(offenders): log(f"Turn OFF: starting (n={n})"))
+                    self.hw.select_quadrant(q)
+                    # For reliability after WDU-like glitches.
+                    try:
+                        self._fifo_ensure_i2c()
+                    except Exception:
+                        pass
+                    off_done = 0
+                    off_skip = 0
+                    off_err = 0
+                    # Disable TDCON for MATs that have offenders (MAT-level).
+                    mats_off: set[int] = set()
+                    for mat_id, ch in offenders:
+                        if 4 <= int(mat_id) <= 7:
+                            off_skip += 1
+                            continue
+                        mats_off.add(int(mat_id))
+                        # Best-effort: disable PIXON and FEON for that channel.
+                        try:
+                            self.hw.AnalogChannelOFF(q, mattonella=int(mat_id), canale=int(ch))
+                        except Exception:
+                            off_err += 1
+                        try:
+                            self.hw.setAnalogFEON(q, mattonella=int(mat_id), canale=int(ch), on=False)
+                        except Exception:
+                            off_err += 1
+                        off_done += 1
+                        time.sleep(0.002)
+                    for mid in sorted(mats_off):
+                        try:
+                            self.hw.EnableTDC(q, Mattonella=int(mid), enable=False)
+                        except Exception:
+                            off_err += 1
+                    self.after(
+                        0,
+                        lambda: log(
+                            f"Turn OFF: done={off_done} mats_tdcoff={len(mats_off)} skipped47={off_skip} errs={off_err}. "
+                            "Tip: re-run Check Calibration to confirm FIFO quiet."
+                        ),
+                    )
+                except Exception as e:
+                    self.after(0, lambda e=e: log(f"Turn OFF error: {e!r}"))
+
+            threading.Thread(target=work_off, daemon=True).start()
+
+        btns = ttk.Frame(root)
+        btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Turn OFF offending channels", command=turn_off_offending).pack(side="left")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+
+        def work() -> None:
+            try:
+                self.after(0, lambda: status_var.set(f"Running… (Q={q})"))
+                self.hw.select_quadrant(q)
+                self._fifo_ensure_i2c()
+                max_iters = 20
+                sample_batches = 8  # each batch reads 24 words (burst)
+                max_words_per_batch = 24
+                total_all = 16 * 64
+                total_adjustable = (16 - 4) * 64  # exclude MAT 4..7 (cannot adjust directly)
+
+                for it in range(max_iters):
+                    # Sample FIFO even if it's continuously refilling (drain may never become empty).
+                    words: list[int] = []
+                    for _ in range(sample_batches):
+                        try:
+                            words.extend(list(self.hw.FifoReadNumWords(max_words_per_batch)))
+                        except Exception:
+                            # fall back to single reads (robust)
+                            try:
+                                words.append(int(self.hw.FifoReadSingleRobust(quad=q, retries=6, backoff_s=0.003, do_bus_recovery=True)))
+                            except Exception:
+                                pass
+                        time.sleep(0.003)
+
+                    active: set[tuple[int, int]] = set()
+                    for w in words:
+                        if int(w) == 0:
+                            continue
+                        try:
+                            d = self._fifo_decode_word(int(w))
+                            if int(d.get("fifo_empty", 0)) == 1 and int(d.get("fifo_cnt", 0)) == 0:
+                                continue
+                            active.add((int(d["mat"]), int(d["channel"])))
+                        except Exception:
+                            continue
+
+                    if not active:
+                        self.after(0, lambda: status_var.set(f"OK: FIFO quiet (Q={q})"))
+                        log("OK: FIFO quiet")
+                        return
+                    # Update shared "last_active" in-place so the Turn OFF button can see it.
+                    with last_lock:
+                        last_active.clear()
+                        last_active.update(active)
+
+                    # Adjust only readable MATs; report 4..7.
+                    skipped_47 = sorted([a for a in active if 4 <= int(a[0]) <= 7])
+                    todo = sorted([a for a in active if not (4 <= int(a[0]) <= 7)])
+
+                    noisy_total = len(active)
+                    noisy_pct = (100.0 * float(noisy_total) / float(total_all)) if total_all else 0.0
+
+                    if skipped_47:
+                        _dbg(
+                            f"Check Calibration: hits on MAT 4..7 cannot be adjusted directly: "
+                            f"{skipped_47[:8]}{'...' if len(skipped_47)>8 else ''}"
+                        )
+                        log(
+                            f"WARN: hits on MAT 4..7 (cannot adjust per-channel): "
+                            f"{skipped_47[:6]}{'...' if len(skipped_47)>6 else ''}"
+                        )
+
+                    changed = 0
+                    at_max = 0
+                    for mat_id, ch in todo:
+                        try:
+                            cur = int(self.hw.readAnalogChannelFineTune(q, mattonella=int(mat_id), canale=int(ch)))
+                        except Exception:
+                            cur = 15
+                        if cur >= 15:
+                            at_max += 1
+                            continue
+                        new = int(cur) + 1
+                        try:
+                            self.hw.AnalogChannelFineTune(q, block=0, mattonella=int(mat_id), canale=int(ch), valore=int(new))
+                            changed += 1
+                            with adjusted_lock:
+                                adjusted_unique.add((int(mat_id), int(ch)))
+                        except Exception as e:
+                            _dbg(f"Check Calibration: set FTCODE failed MAT={mat_id} CH={ch} err={e!r}")
+                            try:
+                                self.hw.i2c_bus_recovery()
+                            except Exception:
+                                pass
+                            continue
+                        # Small delay helps DLL stability
+                        time.sleep(0.005)
+
+                    self.after(
+                        0,
+                        lambda it=it, changed=changed, active=active, at_max=at_max: status_var.set(
+                            f"iter {it+1}/{max_iters}: active={len(active)} adjusted={changed} at_max15={at_max}"
+                        ),
+                    )
+                    with adjusted_lock:
+                        adj_u = int(len(adjusted_unique))
+                    adj_pct = (100.0 * float(adj_u) / float(total_adjustable)) if total_adjustable else 0.0
+                    self.after(
+                        0,
+                        lambda noisy_total=noisy_total, noisy_pct=noisy_pct, adj_u=adj_u, adj_pct=adj_pct: stats_var.set(
+                            f"Noisy channels: {noisy_total}/{total_all} ({noisy_pct:.2f}%)   "
+                            f"Adjusted channels (this run): {adj_u}/{total_adjustable} ({adj_pct:.2f}%)"
+                        ),
+                    )
+                    log(
+                        f"iter {it+1}: active={len(active)} adjusted={changed} at_max15={at_max} "
+                        f"(sampled_words={len(words)})"
+                    )
+                    # Print a short list of noisy channels (first N) for quick visibility.
+                    try:
+                        preview = sorted(list(active))[:20]
+                        log(f"noisy preview: {preview}{' ...' if len(active) > 20 else ''}")
+                    except Exception:
+                        pass
+                    # If nothing changed, we cannot make further progress.
+                    if changed == 0:
+                        self.after(0, lambda: status_var.set(f"STOP: no further increments possible (active={len(active)})"))
+                        if at_max > 0:
+                            log(
+                                "STOP: channels still counting but FTCODE already at 15 for some/all. "
+                                "Need to raise VTHR_H/L or disable offending channels."
+                            )
+                        else:
+                            log("STOP: no increments applied (all channels already at max or unreachable).")
+                        return
+                    time.sleep(0.02)
+
+                self.after(0, lambda: status_var.set("STOP: max iters reached"))
+                log("STOP: max iters reached")
+            except Exception as e:
+                self.after(0, lambda e=e: status_var.set(f"ERROR: {e}"))
+                log(f"ERROR: {e!r}")
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _adc_channel_for_dac(self, dac: str) -> Optional[int]:
         """
         Map internal DAC name to Quad ADC channel when a direct measurement exists.
@@ -1012,8 +1581,14 @@ class Ignite64Gui(tk.Tk):
             return 1
         if d == "VINJ_H":
             return 2
-        # No direct ADC mapping currently exposed for these in our API:
-        # VINJ_L, VLDO, VFB
+        # C# convention used in our GUI:
+        # - "VLDO" measurement is Vref_L (ADC channel 3)
+        # - "VFB"/"VF" measurement is Vfeed (ADC channel 4)
+        if d == "VLDO":
+            return 3
+        if d in {"VFB", "VF"}:
+            return 4
+        # No direct ADC mapping currently exposed for these in our API: VINJ_L
         return None
 
     # -----
@@ -1040,11 +1615,16 @@ class Ignite64Gui(tk.Tk):
         """Per-quadrant counts (full MAT×pixel scan — runs in a worker thread)."""
         analog_on = 0
         for mat in range(16):
+            # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+            if 4 <= int(mat) <= 7:
+                continue
             for ch in range(64):
                 if self.hw.readAnalogChannelON(quad, mattonella=mat, canale=ch):
                     analog_on += 1
         tdc_mats = 0
         for mat in range(16):
+            if 4 <= int(mat) <= 7:
+                continue
             if self.hw.readEnableTDC(quad, Mattonella=mat)["tdc_on"]:
                 tdc_mats += 1
         return {"analog_on": analog_on, "digpix_on": analog_on, "tdc_mats": tdc_mats}
@@ -1169,11 +1749,12 @@ class Ignite64Gui(tk.Tk):
 
                 self.after(0, apply)
             except Exception as e:
+                err_s = str(e)
 
                 def fail() -> None:
                     if seq != self._quadrants_mon_seq:
                         return
-                    self._apply_monitor_panels_error(str(e))
+                    self._apply_monitor_panels_error(err_s)
 
                 self.after(0, fail)
 
@@ -1629,18 +2210,25 @@ class Ignite64Gui(tk.Tk):
                 self._set_status("Analog Power toggle (offline)")
                 return
 
+            quad_dbg = str(self.quad_var.get()).strip().upper()
+            _dbg(f"Analog Power toggle pressed (quad={quad_dbg})")
+
             def do() -> bool:
-                cur = bool(self.hw.readAnalogPower())
+                cur_raw = self.hw.readAnalogPower()
+                cur = bool(cur_raw)
                 target = not cur
+                _dbg(f"Analog Power read cur_raw={cur_raw!r} cur={cur} → target={target}")
                 self.hw.setAnalogPower(target)
                 return target
 
             new_state = self._with_hw(do, busy=f"Analog Power toggle (Q={self.quad_var.get()})")
             if new_state is None or not isinstance(new_state, bool):
+                _dbg(f"Analog Power toggle failed new_state={new_state!r}")
                 return
 
             # Optimistic UI update; monitor will re-sync next tick anyway.
             self._update_analog_power_button(power_ok=new_state, power_err=None)
+            _dbg(f"Analog Power toggle completed new_state={new_state}")
 
         # Prefer a classic tk.Button (tk/tile colors are more consistent than ttk style backgrounds).
         self._analog_power_btn = tk.Button(
@@ -1914,6 +2502,168 @@ class Ignite64Gui(tk.Tk):
         top = ttk.Frame(frm)
         top.pack(fill="both", expand=True)
 
+        def refresh_blocks_hw() -> None:
+            try:
+                self._blocks_view_force_hw = True
+                # Read full snapshot from HW for the quadrant (best-effort for MAT 4..7).
+                self._quadrant_full_refresh(self.quad_var.get())
+                cb = getattr(self, "_blocks_view_refresh_cb", None)
+                if callable(cb):
+                    cb()
+            finally:
+                self._blocks_view_force_hw = False
+
+        # IREF is a quadrant-level setting (external DAC). Place it here (overview page).
+        try:
+            self._iref_sync_for_quad(quad)
+        except Exception:
+            pass
+        iref_bar = ttk.Frame(top)
+        iref_bar.pack(fill="x", pady=(0, 8))
+        ttk.Button(iref_bar, text="Refresh", command=refresh_blocks_hw).pack(side="right", padx=(0, 6))
+        ttk.Button(iref_bar, text="Check Calibration", command=lambda q=str(self.quad_var.get()).strip().upper(): self._check_calibration(q)).pack(
+            side="right", padx=(0, 6)
+        )
+        iref = ttk.Labelframe(iref_bar, text=f"IREF (mV) — quad {str(quad).strip().upper()}", padding=(6, 4))
+        iref.pack(side="left")
+        ttk.Button(iref, text="Read", command=lambda q=quad: self._iref_read(q)).pack(side="left")
+        iref_entry = ttk.Entry(iref, width=10, textvariable=self._iref_var)
+        iref_entry.pack(side="left", padx=(6, 6))
+        ttk.Button(iref, text="Set", command=lambda q=quad, e=iref_entry: self._iref_set(q, e.get())).pack(side="left")
+        ttk.Label(iref, textvariable=self._iref_meas_var).pack(side="left", padx=(10, 0))
+
+        # Quadrant-wide ALL toggles (persist per quadrant).
+        qkey = str(quad).strip().upper()
+        if qkey not in self._quad_all_vars:
+            self._quad_all_vars[qkey] = {
+                "fe": tk.BooleanVar(value=False),
+                "px": tk.BooleanVar(value=False),
+                "td": tk.BooleanVar(value=False),
+            }
+        q_fe = self._quad_all_vars[qkey]["fe"]
+        q_px = self._quad_all_vars[qkey]["px"]
+        q_td = self._quad_all_vars[qkey]["td"]
+
+        def apply_quad_all(*, feon: Optional[bool] = None, pixon: Optional[bool] = None, tdcon: Optional[bool] = None) -> None:
+            q = str(self.quad_var.get()).strip().upper()
+
+            def do() -> None:
+                self.hw.select_quadrant(q)
+                # Small delay helps reliability on some setups (mirrors C# scattered Task.Delay(1..3)).
+                try:
+                    per_write_delay_s = float(os.environ.get("IGNITE64_I2C_DELAY_S", "0.001").strip())
+                except Exception:
+                    per_write_delay_s = 0.001
+                if per_write_delay_s < 0:
+                    per_write_delay_s = 0.0
+                # Broadcast writes (C# uses MAT ID 254) within the selected quadrant.
+                bdev = 254
+                # For broadcast read-modify-write, mimic C# behavior: read "base" values from a safe MAT
+                # (broadcast devices often don't support readback directly).
+                base_mid = 0
+                if tdcon is not None:
+                    reg = 64
+                    old = int(self.hw.i2c_read_byte(self.hw.matid_to_devaddr(base_mid), reg))
+                    new = (old & ~0x40) | (0x40 if bool(tdcon) else 0x00)
+                    self.hw.i2c_write_byte(bdev, reg, int(new) & 0xFF)
+                    if per_write_delay_s:
+                        time.sleep(per_write_delay_s)
+                if feon is not None or pixon is not None:
+                    for ch in range(64):
+                        old = int(self.hw.i2c_read_byte(self.hw.matid_to_devaddr(base_mid), int(ch)))
+                        new = old
+                        if feon is not None:
+                            new = (new & ~0x80) | (0x80 if bool(feon) else 0x00)
+                        if pixon is not None:
+                            new = (new & ~0x40) | (0x40 if bool(pixon) else 0x00)
+                        self.hw.i2c_write_byte(bdev, int(ch), int(new) & 0xFF)
+                        if per_write_delay_s:
+                            time.sleep(per_write_delay_s)
+
+                # Best-effort verify broadcast succeeded by reading back from safe MATs.
+                # We can't read MAT 4..7, but broadcast should also affect MAT0/8/etc.
+                try:
+                    verify_mats = [0, 8, 12]
+                    for vm in verify_mats:
+                        if 4 <= int(vm) <= 7:
+                            continue
+                        vdev = self.hw.matid_to_devaddr(int(vm))
+                        if tdcon is not None:
+                            vv = int(self.hw.i2c_read_byte(vdev, 64))
+                            want = 1 if bool(tdcon) else 0
+                            got = 1 if (vv & 0x40) else 0
+                            if got != want:
+                                _dbg(f"broadcast verify mismatch: MAT{vm} reg64 TDCON got={got} want={want} vv=0x{vv:02X}")
+                        if feon is not None or pixon is not None:
+                            for vch in (0, 1, 2, 31, 32, 63):
+                                vv = int(self.hw.i2c_read_byte(vdev, int(vch)))
+                                if feon is not None:
+                                    want = 1 if bool(feon) else 0
+                                    got = 1 if (vv & 0x80) else 0
+                                    if got != want:
+                                        _dbg(
+                                            f"broadcast verify mismatch: MAT{vm} ch{vch} FEON got={got} want={want} vv=0x{vv:02X}"
+                                        )
+                                if pixon is not None:
+                                    want = 1 if bool(pixon) else 0
+                                    got = 1 if (vv & 0x40) else 0
+                                    if got != want:
+                                        _dbg(
+                                            f"broadcast verify mismatch: MAT{vm} ch{vch} PIXON got={got} want={want} vv=0x{vv:02X}"
+                                        )
+                except Exception:
+                    pass
+
+            self._with_hw(do, busy=f"Apply ALL (quad={q})")
+            # Update GUI cache for all MATs (including 4..7 which we never read directly).
+            # This makes quadrant colors reflect broadcast actions immediately.
+            try:
+                qk = str(q).strip().upper()
+                qc = self._mat_snapshot_cache.setdefault(qk, {})
+                for mid in range(16):
+                    ent = qc.get(int(mid))
+                    if not isinstance(ent, dict):
+                        ent = {}
+                        qc[int(mid)] = ent
+                    po = ent.get("pix_on")
+                    fo = ent.get("fe_on")
+                    if not isinstance(po, list) or len(po) < 64:
+                        po = [False] * 64
+                    if not isinstance(fo, list) or len(fo) < 64:
+                        fo = [True] * 64
+                    if pixon is not None:
+                        po = [bool(pixon)] * 64
+                    if feon is not None:
+                        fo = [bool(feon)] * 64
+                    ent["pix_on"] = po
+                    ent["fe_on"] = fo
+            except Exception:
+                pass
+
+            # Drop file-prefill mode and force refresh of block widgets.
+            self._mat_snapshot_prefill_active = False
+            try:
+                self._blocks_view_force_hw = True
+                # After broadcast, do a full refresh to keep quadrant view equivalent to C#.
+                self._quadrant_full_refresh(q)
+                cb = getattr(self, "_blocks_view_refresh_cb", None)
+                if callable(cb):
+                    cb()
+            finally:
+                self._blocks_view_force_hw = False
+
+        all_bar = ttk.Labelframe(iref_bar, text="ALL (quadrant)", padding=(6, 4))
+        all_bar.pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(all_bar, text="FEON ALL", variable=q_fe, command=lambda: apply_quad_all(feon=bool(q_fe.get()))).pack(
+            side="left"
+        )
+        ttk.Checkbutton(all_bar, text="PIXON ALL", variable=q_px, command=lambda: apply_quad_all(pixon=bool(q_px.get()))).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Checkbutton(all_bar, text="TDCON ALL", variable=q_td, command=lambda: apply_quad_all(tdcon=bool(q_td.get()))).pack(
+            side="left", padx=(8, 0)
+        )
+
         grid = ttk.Frame(top)
         grid.pack(side="left", fill="both", expand=True)
 
@@ -1944,6 +2694,15 @@ class Ignite64Gui(tk.Tk):
             mat_cache: dict[int, Optional[dict[str, object]]] = {mid: None for mid in mats}
             _fetch_gen: list[int] = [0]
             _fetch_after: list[Optional[str]] = [None]
+
+            # Se abbiamo uno snapshot pre-riempito da FILE, usa subito quei valori
+            # per rendere la vista block coerente senza leggere l'intero chip.
+            if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+                qkey_seed = str(self.quad_var.get()).strip().upper()
+                cached_for_quad_seed = self._mat_snapshot_cache.get(qkey_seed, {})
+                for mid in mats:
+                    if int(mid) in cached_for_quad_seed:
+                        mat_cache[mid] = cached_for_quad_seed[int(mid)]
 
             def redraw_display(_ev=None) -> None:
                 c.delete("all")
@@ -1989,6 +2748,11 @@ class Ignite64Gui(tk.Tk):
                     gy1 = ry1 - ft_h
                     outline_col = "#2f2f2f"
                     entry = mat_cache.get(mat_id)
+                    if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+                        qkey = str(self.quad_var.get()).strip().upper()
+                        cached = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
+                        if isinstance(cached, dict):
+                            entry = cached
                     err_t = None
                     if isinstance(entry, dict) and entry.get("_err"):
                         err_t = str(entry["_err"])
@@ -2013,13 +2777,17 @@ class Ignite64Gui(tk.Tk):
                         return
 
                     pix_on: Optional[list[bool]] = None
+                    fe_on: Optional[list[bool]] = None
                     ftdac: Optional[list[int]] = None
                     if isinstance(entry, dict) and not entry.get("_err"):
                         po = entry.get("pix_on")
+                        fo = entry.get("fe_on")
                         ft = entry.get("ftdac")
                         if isinstance(po, list) and isinstance(ft, list) and len(po) >= 64 and len(ft) >= 64:
                             pix_on = [bool(x) for x in po[:64]]
                             ftdac = [int(x) for x in ft[:64]]
+                            if isinstance(fo, list) and len(fo) >= 64:
+                                fe_on = [bool(x) for x in fo[:64]]
 
                     cell_w = gw / 8.0
                     cell_h = gh / 8.0
@@ -2032,7 +2800,11 @@ class Ignite64Gui(tk.Tk):
                             cx1 = ix0 + (col + 1) * cell_w - cg
                             cy1 = iy0 + (row + 1) * cell_h - cg
                             if pix_on is not None:
-                                fill = "#2e7d32" if pix_on[ch] else "#eceff1"
+                                # Match block-detail view: green=ON, red=OFF (user expects "spenti" = rosso).
+                                if fe_on is not None and not fe_on[ch]:
+                                    fill = "#bdbdbd"
+                                else:
+                                    fill = "#2e7d32" if pix_on[ch] else "#aa2222"
                                 ol = "#37474f"
                             elif self.offline:
                                 fill = "#eeeeee"
@@ -2087,6 +2859,14 @@ class Ignite64Gui(tk.Tk):
                 )
 
             def schedule_fetch() -> None:
+                if bool(getattr(self, "_snapshot_capture_in_progress", False)):
+                    return
+                if (not bool(getattr(self, "_blocks_view_force_hw", False))) and self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+                    qkey = str(self.quad_var.get()).strip().upper()
+                    cached_for_quad = self._mat_snapshot_cache.get(qkey, {})
+                    # Skip HW reads if we already have cached MAT data for this block.
+                    if all(int(mid) in cached_for_quad for mid in mats):
+                        return
                 if _fetch_after[0] is not None:
                     try:
                         self.after_cancel(_fetch_after[0])
@@ -2106,23 +2886,29 @@ class Ignite64Gui(tk.Tk):
                         try:
                             out: dict[int, dict[str, object]] = {}
                             for mid in mats:
+                                # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+                                # Never touch them directly here (block 1 is MAT 4..7).
+                                if 4 <= int(mid) <= 7:
+                                    continue
                                 out[mid] = self.hw.readMatPixelsAndFTDAC(quad_q, mattonella=mid)
 
                             def apply_ok() -> None:
                                 if gen != _fetch_gen[0]:
                                     return
                                 for mid in mats:
-                                    mat_cache[mid] = out[mid]
+                                    if mid in out:
+                                        mat_cache[mid] = out[mid]
                                 redraw_display()
 
                             self.after(0, apply_ok)
                         except Exception as e:
+                            err_s = str(e)
 
                             def apply_err() -> None:
                                 if gen != _fetch_gen[0]:
                                     return
                                 for mid in mats:
-                                    mat_cache[mid] = {"_err": str(e)}
+                                    mat_cache[mid] = {"_err": err_s}
                                 redraw_display()
 
                             self.after(0, apply_err)
@@ -2150,12 +2936,24 @@ class Ignite64Gui(tk.Tk):
 
             return outer
 
+        _refreshers: list[object] = []
         for block_id in range(4):
             w = make_block_widget(grid, block_id=block_id)
             r, c = divmod(block_id, 2)
             w.grid(row=r, column=c, padx=12, pady=12, sticky="nsew")
             grid.grid_columnconfigure(c, weight=1)
             grid.grid_rowconfigure(r, weight=1)
+
+        # Expose a refresh callback for the current blocks view (used after broadcast ops).
+        def _refresh_blocks_view() -> None:
+            # Trigger a fetch+redraw on next idle tick.
+            for child in grid.winfo_children():
+                try:
+                    child.event_generate("<Configure>")
+                except Exception:
+                    pass
+
+        self._blocks_view_refresh_cb = _refresh_blocks_view
 
         # FIFO panel (monitoring / debug)
         fifo = ttk.Labelframe(top, text="Quadrant FIFO (I2C) — monitor", padding=8)
@@ -2204,14 +3002,24 @@ class Ignite64Gui(tk.Tk):
                 self._fifo_log(out, "EMPTY")
                 fifo_summary_var.set(f"Ultimo read Q={quad2}: FIFO vuota (EMPTY)")
                 return
+            # Some firmwares return the last non-empty word even when FIFO is empty.
+            # Trust the embedded FIFO-empty flag (bit47) over the raw 64-bit value.
+            try:
+                d0 = self._fifo_decode_word(w)
+                if int(d0.get("fifo_empty", 0)) == 1 and int(d0.get("fifo_cnt", 0)) == 0:
+                    self._fifo_log(out, "EMPTY")
+                    fifo_summary_var.set(f"Ultimo read Q={quad2}: FIFO vuota (empty flag)")
+                    return
+            except Exception:
+                d0 = {}
             if not decoded:
                 self._fifo_log(out, f"0x{w:016X}")
                 fifo_summary_var.set(f"Ultimo read Q={quad2}: word raw 0x{w:016X}")
                 return
-            d = self._fifo_decode_word(w)
+            d = d0 if d0 else self._fifo_decode_word(w)
             self._fifo_log(
                 out,
-                f"0x{w:016X}  MAT={d['mat']:2d}  CH={d['channel']:2d}  "
+                f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
                 f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
             )
             fifo_summary_var.set(
@@ -2225,7 +3033,7 @@ class Ignite64Gui(tk.Tk):
             def do() -> list[int]:
                 self._fifo_ensure_i2c()
                 self.hw.select_quadrant(quad2)
-                return list(self.hw.FifoDrain(max_words=4096))
+                return list(self.hw.FifoDrain(max_words=128))
 
             ws = self._with_hw(do, busy=f"FIFO drain (Q={quad2})")
             if ws is None:
@@ -2235,18 +3043,28 @@ class Ignite64Gui(tk.Tk):
                 self._fifo_log(out, "DRAIN: empty")
                 fifo_summary_var.set(f"Drain Q={quad2}: FIFO vuota")
                 return
-            self._fifo_log(out, f"DRAIN: {len(words)} words")
-            fifo_summary_var.set(f"Drain Q={quad2}: {len(words)} parole lette")
+            # Stop on first "empty-flag" word to avoid printing a repeated stale word.
+            n_eff = 0
             for w in words:
-                if w == 0:
-                    continue
+                if int(w) == 0:
+                    break
+                try:
+                    dchk = self._fifo_decode_word(int(w))
+                    if int(dchk.get("fifo_empty", 0)) == 1 and int(dchk.get("fifo_cnt", 0)) == 0:
+                        break
+                except Exception:
+                    pass
+                n_eff += 1
+            self._fifo_log(out, f"DRAIN: {n_eff} words")
+            fifo_summary_var.set(f"Drain Q={quad2}: {n_eff} parole lette")
+            for w in words[:n_eff]:
                 if not decoded:
                     self._fifo_log(out, f"0x{w:016X}")
                 else:
                     d = self._fifo_decode_word(w)
                     self._fifo_log(
                         out,
-                        f"0x{w:016X}  MAT={d['mat']:2d}  CH={d['channel']:2d}  "
+                        f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
                         f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
                     )
 
@@ -2307,7 +3125,36 @@ class Ignite64Gui(tk.Tk):
         toolbar = ttk.Frame(frm)
         toolbar.pack(fill="x", pady=(0, 8))
         ttk.Button(toolbar, text="Refresh block", command=lambda: self._refresh_block(block_id)).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Open analog details", command=lambda: self._open_analog(block_id)).pack(side="left", padx=6)
+        ttk.Button(
+            toolbar,
+            text="FIFO…",
+            command=lambda q=str(self.quad_var.get()).strip().upper(): self._open_fifo_popup(q),
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Calibra canali…", command=lambda bid=block_id: self._calib_block_threshold(bid)).pack(
+            side="left", padx=(6, 0)
+        )
+        # ALL toggles for this block
+        fe_all = tk.BooleanVar(value=False)
+        px_all = tk.BooleanVar(value=False)
+        td_all = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar,
+            text="FEON ALL",
+            variable=fe_all,
+            command=lambda: self._set_block_all(block_id, feon=bool(fe_all.get())),
+        ).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(
+            toolbar,
+            text="PIXON ALL",
+            variable=px_all,
+            command=lambda: self._set_block_all(block_id, pixon=bool(px_all.get())),
+        ).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(
+            toolbar,
+            text="TDCON ALL",
+            variable=td_all,
+            command=lambda: self._set_block_all(block_id, tdcon=bool(td_all.get())),
+        ).pack(side="left", padx=(6, 0))
 
         ttk.Separator(frm).pack(fill="x", pady=8)
 
@@ -2343,6 +3190,497 @@ class Ignite64Gui(tk.Tk):
 
         self._refresh_block(block_id)
         return frm
+
+    def _open_fifo_popup(self, quad: str) -> None:
+        """
+        Quick FIFO monitor popup, usable from Block view (so you don't need to go back to Quadrant view).
+        """
+        q = str(quad).strip().upper()
+        win = tk.Toplevel(self)
+        win.title(f"FIFO monitor — Q={q}")
+        win.transient(self)
+        win.resizable(True, True)
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill="both", expand=True)
+
+        summary = tk.StringVar(value=f"FIFO: — (Q={q})")
+        ttk.Label(root, textvariable=summary, wraplength=520, font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 8))
+
+        btns = ttk.Frame(root)
+        btns.pack(fill="x", pady=(0, 6))
+        btns2 = ttk.Frame(root)
+        btns2.pack(fill="x", pady=(0, 6))
+
+        out = tk.Text(root, height=18, width=72, wrap="none", state="disabled")
+        yscroll = ttk.Scrollbar(root, orient="vertical", command=out.yview)
+        out.configure(yscrollcommand=yscroll.set)
+        out.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        def read_one(decoded: bool) -> None:
+            def do() -> int:
+                self._fifo_ensure_i2c()
+                self.hw.select_quadrant(q)
+                return int(self.hw.FifoReadSingle())
+
+            w = self._with_hw(do, busy=f"FIFO read (Q={q})")
+            if w is None:
+                return
+            w = int(w)
+            if w == 0:
+                self._fifo_log(out, "EMPTY")
+                summary.set(f"Q={q}: EMPTY")
+                return
+            try:
+                d0 = self._fifo_decode_word(w)
+                if int(d0.get("fifo_empty", 0)) == 1 and int(d0.get("fifo_cnt", 0)) == 0:
+                    self._fifo_log(out, "EMPTY")
+                    summary.set(f"Q={q}: EMPTY (flag)")
+                    return
+            except Exception:
+                d0 = {}
+            if not decoded:
+                self._fifo_log(out, f"0x{w:016X}")
+                summary.set(f"Q={q}: raw 0x{w:016X}")
+                return
+            d = d0 if d0 else self._fifo_decode_word(w)
+            self._fifo_log(
+                out,
+                f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
+                f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
+            )
+            summary.set(f"Q={q}: MAT={d['mat']:02d} CH={d['channel']:02d} empty={d['fifo_empty']} cnt={d['fifo_cnt']}")
+
+        def drain(decoded: bool) -> None:
+            def do() -> list[int]:
+                self._fifo_ensure_i2c()
+                self.hw.select_quadrant(q)
+                return list(self.hw.FifoDrain(max_words=128))
+
+            ws = self._with_hw(do, busy=f"FIFO drain (Q={q})")
+            if ws is None:
+                return
+            words = [int(x) for x in ws]  # type: ignore[arg-type]
+            n_eff = 0
+            for w in words:
+                if int(w) == 0:
+                    break
+                try:
+                    dchk = self._fifo_decode_word(int(w))
+                    if int(dchk.get("fifo_empty", 0)) == 1 and int(dchk.get("fifo_cnt", 0)) == 0:
+                        break
+                except Exception:
+                    pass
+                n_eff += 1
+            self._fifo_log(out, f"DRAIN: {n_eff} words")
+            summary.set(f"Q={q}: DRAIN {n_eff} words")
+            for w in words[:n_eff]:
+                if not decoded:
+                    self._fifo_log(out, f"0x{w:016X}")
+                else:
+                    d = self._fifo_decode_word(w)
+                    self._fifo_log(
+                        out,
+                        f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
+                        f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
+                    )
+
+        ttk.Button(btns, text="Read 1 (decoded)", command=lambda: read_one(True)).pack(side="left", padx=3)
+        ttk.Button(btns, text="Read 1 (raw)", command=lambda: read_one(False)).pack(side="left", padx=3)
+        ttk.Button(btns, text="Drain (decoded)", command=lambda: drain(True)).pack(side="left", padx=3)
+        ttk.Button(btns, text="Drain (raw)", command=lambda: drain(False)).pack(side="left", padx=3)
+
+        auto_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btns2, text="Auto", variable=auto_var).pack(side="left", padx=(0, 6))
+        ttk.Label(btns2, text="ms:").pack(side="left")
+        auto_ms = tk.StringVar(value="200")
+        ttk.Entry(btns2, textvariable=auto_ms, width=6).pack(side="left", padx=(4, 0))
+
+        def auto_tick() -> None:
+            if not bool(auto_var.get()):
+                return
+            read_one(True)
+            try:
+                ms = int(str(auto_ms.get()).strip())
+            except Exception:
+                ms = 200
+            if ms < 20:
+                ms = 20
+            win.after(int(ms), auto_tick)
+
+        auto_var.trace_add("write", lambda *_a: (auto_tick() if bool(auto_var.get()) else None))
+
+    def _calib_block_threshold(self, block_id: int) -> None:
+        """
+        Experimental: calibrate threshold for all channels in a block, sequentially,
+        using the *same* single-channel calibration routine.
+
+        For each channel:
+        - enable only that channel (PIXON + FEON) and enable TDCON for that MAT
+        - start from FTCODE=15
+        - sweep down until first FIFO hit, then set previous code
+        """
+        quad = str(self.quad_var.get()).strip().upper()
+        mats = self.mapping.mats_in_block(int(block_id))
+
+        win = tk.Toplevel(self)
+        win.title(f"Calibrazione soglia — Block {block_id} (Q={quad})")
+        win.transient(self)
+        win.resizable(True, True)
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill="both", expand=True)
+
+        ttk.Label(
+            root,
+            text=(
+                "Calibrazione blocco: calibra canale per canale via FIFO.\n"
+                "Per ogni canale abilita PIXON+FEON (solo quel canale) e abilita TDCON della MAT.\n"
+                "Nota: MAT 4..7 vengono saltate (accesso I2C diretto disabilitato)."
+            ),
+            font=("Segoe UI", 9),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        params = ttk.Labelframe(root, text="Parametri", padding=8)
+        params.pack(fill="x", pady=(0, 8))
+
+        step_code = tk.StringVar(value="1")
+        min_code = tk.StringVar(value="0")
+        settle_ms = tk.StringVar(value="5")
+        poll_ms = tk.StringVar(value="50")
+        polls_per_step = tk.StringVar(value="10")
+        start_code = tk.StringVar(value="15")
+        start_mat = tk.StringVar(value=str(int(mats[0]) if mats else 0))
+        start_ch = tk.StringVar(value="0")
+
+        def _row(r: int, label: str, var: tk.StringVar) -> None:
+            ttk.Label(params, text=label, width=18).grid(row=r, column=0, sticky="w")
+            ttk.Entry(params, textvariable=var, width=8).grid(row=r, column=1, sticky="w", padx=(6, 0))
+
+        _row(0, "Step Δ:", step_code)
+        _row(1, "Min FTCODE:", min_code)
+        _row(2, "Start FTCODE:", start_code)
+        _row(3, "Settle (ms):", settle_ms)
+        _row(4, "Poll every (ms):", poll_ms)
+        _row(5, "Polls/step:", polls_per_step)
+        _row(6, "Start MAT:", start_mat)
+        _row(7, "Start CH:", start_ch)
+
+        status = tk.StringVar(value="—")
+        ttk.Label(root, textvariable=status, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+
+        out = tk.Text(root, height=18, width=92, wrap="none", state="disabled")
+        yscroll = ttk.Scrollbar(root, orient="vertical", command=out.yview)
+        out.configure(yscrollcommand=yscroll.set)
+        out.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        stop_evt = threading.Event()
+
+        def log(msg: str) -> None:
+            self._fifo_log(out, msg)
+
+        def fifo_hit_expected(mat_id: int, ch: int) -> bool:
+            """
+            Return True only if the FIFO hit refers to the *current* (mat_id, ch).
+            This prevents false calibration on a stale hit coming from the previous channel.
+            """
+            try:
+                w = int(self.hw.FifoReadSingleRobust(quad=quad, retries=12, backoff_s=0.003, do_bus_recovery=True))
+            except Exception as e:
+                log(f"FIFO read error: {e!r}")
+                return False
+            if int(w) == 0:
+                return False
+            try:
+                d = self._fifo_decode_word(int(w))
+                if int(d.get("fifo_empty", 0)) == 1 and int(d.get("fifo_cnt", 0)) == 0:
+                    return False
+                # If the hit is not for the current channel, drain a bit and ignore.
+                if int(d.get("mat", -1)) != int(mat_id) or int(d.get("channel", -1)) != int(ch):
+                    log(
+                        f"HIT(other): MAT={d['mat']:2d} CH={d['channel']:2d} "
+                        f"(expected MAT={int(mat_id):2d} CH={int(ch):2d}) cnt={d['fifo_cnt']:3d}"
+                    )
+                    try:
+                        _ = self.hw.FifoDrain(max_words=32)
+                    except Exception:
+                        pass
+                    return False
+                log(
+                    f"HIT: MAT={d['mat']:2d} CH={d['channel']:2d} "
+                    f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}"
+                )
+                return True
+            except Exception:
+                # If decode fails, treat as a hit (best-effort) but still keep it conservative.
+                log(f"HIT(raw): 0x{int(w):016X}")
+                return True
+
+        def _calib_one(mat_id: int, ch: int, *, sc: int, step: int, mn: int, st_ms: int, p_ms: int, n_polls: int) -> Optional[int]:
+            """
+            Single-channel calibration routine used by both popup and block calibration.
+            Returns calibrated FTCODE or None if no hit.
+            """
+            def _is_wdu_err(e: Exception) -> bool:
+                s = str(e)
+                return ("WDU_Transfer" in s) or ("0x20000015" in s) or ("WD" in s and "Transfer" in s)
+
+            def _try(fn, *, what: str, retries: int = 4) -> bool:
+                last: Optional[Exception] = None
+                for i in range(max(1, int(retries))):
+                    try:
+                        fn()
+                        return True
+                    except Exception as e:
+                        last = e
+                        # If the USB driver/DLL is failing, stop early to avoid wedging it further.
+                        try:
+                            if _is_wdu_err(e):
+                                stop_evt.set()
+                                log(f"ABORT: USB/DLL transfer error during {what}: {e!r}")
+                                return False
+                        except Exception:
+                            pass
+                        try:
+                            self.hw.i2c_bus_recovery()
+                        except Exception:
+                            pass
+                        time.sleep(0.005 * float(i + 1))
+                if last is not None:
+                    log(f"HW error during {what}: {last!r}")
+                return False
+
+            _try(lambda: self.hw.select_quadrant(quad), what="select_quadrant")
+            _try(lambda: self._fifo_ensure_i2c(), what="TopReadout(i2c)")
+            # Enable only this channel: FEON+PIXON and enable TDCON for this MAT.
+            _try(lambda: self.hw.setAnalogFEON(quad, mattonella=int(mat_id), canale=int(ch), on=True), what="FEON ON")
+            _try(lambda: self.hw.AnalogChannelON(quad, mattonella=int(mat_id), canale=int(ch)), what="PIXON ON")
+            _try(lambda: self.hw.EnableTDC(quad, Mattonella=int(mat_id), enable=True), what="TDCON ON")
+            # Drain FIFO before starting this channel.
+            try:
+                _ = self.hw.FifoDrain(max_words=128)
+            except Exception:
+                pass
+
+            prev_code = int(sc)
+            code = int(sc)
+            # Force starting FTCODE now (avoid inheriting previous channel's code).
+            if not _try(
+                lambda: self.hw.AnalogChannelFineTune(quad, block=0, mattonella=int(mat_id), canale=int(ch), valore=int(code)),
+                what=f"Set FTCODE={int(code)}",
+                retries=5,
+            ):
+                return None
+            if st_ms:
+                time.sleep(float(st_ms) / 1000.0)
+            while code >= mn and not stop_evt.is_set():
+                # Set code
+                if not _try(
+                    lambda c=code: self.hw.AnalogChannelFineTune(
+                        quad, block=0, mattonella=int(mat_id), canale=int(ch), valore=int(c)
+                    ),
+                    what=f"Set FTCODE={int(code)}",
+                    retries=5,
+                ):
+                    return None
+                if st_ms:
+                    time.sleep(float(st_ms) / 1000.0)
+                hit = False
+                for _j in range(n_polls):
+                    if stop_evt.is_set():
+                        break
+                    if fifo_hit_expected(int(mat_id), int(ch)):
+                        hit = True
+                        break
+                    time.sleep(float(p_ms) / 1000.0)
+                if hit:
+                    calib = max(0, min(15, int(prev_code)))
+                    _try(
+                        lambda: self.hw.AnalogChannelFineTune(
+                            quad, block=0, mattonella=int(mat_id), canale=int(ch), valore=int(calib)
+                        ),
+                        what=f"Set calibrated FTCODE={int(calib)}",
+                        retries=5,
+                    )
+                    return int(calib)
+                prev_code = code
+                code -= int(step)
+            return None
+
+        def worker() -> None:
+            try:
+                self._fifo_ensure_i2c()
+                self.hw.select_quadrant(quad)
+
+                step = int(str(step_code.get()).strip() or "1")
+                if step <= 0:
+                    step = 1
+                mn = int(str(min_code.get()).strip() or "0")
+                mn = max(0, min(15, mn))
+                try:
+                    sc = int(str(start_code.get()).strip() or "15")
+                except Exception:
+                    sc = 15
+                sc = max(0, min(15, sc))
+                st_ms = int(str(settle_ms.get()).strip() or "5")
+                st_ms = max(0, st_ms)
+                # Avoid stressing the USB/I2C DLL too aggressively (WDU_Transfer errors).
+                if st_ms < 5:
+                    st_ms = 5
+                p_ms = int(str(poll_ms.get()).strip() or "50")
+                p_ms = max(1, p_ms)
+                if p_ms < 5:
+                    p_ms = 5
+                n_polls = int(str(polls_per_step.get()).strip() or "10")
+                n_polls = max(1, n_polls)
+
+                try:
+                    sm = int(str(start_mat.get()).strip() or str(int(mats[0]) if mats else 0))
+                except Exception:
+                    sm = int(mats[0]) if mats else 0
+                try:
+                    sch = int(str(start_ch.get()).strip() or "0")
+                except Exception:
+                    sch = 0
+                sch = max(0, min(63, int(sch)))
+                log(f"RESUME from MAT {int(sm)} CH {int(sch)}")
+                resume_started = False
+                self.after(0, lambda: status.set("Calibrazione: start canali…"))
+                log(f"BLOCK {block_id} mats={mats}")
+
+                # During calibration keep ONLY the current channel active:
+                # - disable all PIXON in this block
+                # - disable TDCON for the MATs in this block
+                self.after(0, lambda: status.set("Preparazione: spegni PIXON/TDCON (solo canale corrente durante calib)…"))
+                for mid in mats:
+                    if stop_evt.is_set():
+                        return
+                    if 4 <= int(mid) <= 7:
+                        log(f"SKIP MAT {mid}: direct I2C disabled (4..7)")
+                        continue
+                    try:
+                        self.hw.EnableTDC(quad, Mattonella=int(mid), enable=False)
+                    except Exception:
+                        pass
+                    for ch in range(64):
+                        if stop_evt.is_set():
+                            return
+                        try:
+                            self.hw.AnalogChannelOFF(quad, mattonella=int(mid), canale=int(ch))
+                        except Exception:
+                            pass
+
+                # Calibrate channels sequentially.
+                for mid in mats:
+                    if stop_evt.is_set():
+                        return
+                    if 4 <= int(mid) <= 7:
+                        continue
+                    for ch in range(64):
+                        if stop_evt.is_set():
+                            return
+                        if not resume_started:
+                            if int(mid) < int(sm):
+                                continue
+                            if int(mid) == int(sm) and int(ch) < int(sch):
+                                continue
+                            resume_started = True
+                        # Keep track of where we are, so the user can resume.
+                        try:
+                            start_mat.set(str(int(mid)))
+                            start_ch.set(str(int(ch)))
+                        except Exception:
+                            pass
+                        self.after(
+                            0,
+                            lambda m=mid, c=ch, code=sc: status.set(f"Calibrando MAT {m} CH {c} (start={code})…"),
+                        )
+                        log(f"START MAT {int(mid)} CH {int(ch)} FTCODE={int(sc)}")
+                        try:
+                            calib = _calib_one(
+                            int(mid),
+                            int(ch),
+                            sc=int(sc),
+                            step=int(step),
+                            mn=int(mn),
+                            st_ms=int(st_ms),
+                            p_ms=int(p_ms),
+                            n_polls=int(n_polls),
+                        )
+                        except Exception as e:
+                            log(f"ERROR MAT {int(mid)} CH {int(ch)}: {e!r}")
+                            try:
+                                self.hw.i2c_bus_recovery()
+                            except Exception:
+                                pass
+                            continue
+                        if stop_evt.is_set():
+                            self.after(0, lambda: status.set("ABORT: errore USB/DLL (WDU). Riparti da Start MAT/CH."))
+                            return
+                        if calib is None:
+                            log(f"NOHIT MAT {int(mid)} CH {int(ch)} (reached min={mn})")
+                        else:
+                            log(f"DONE MAT {int(mid)} CH {int(ch)} calibrated FTCODE={int(calib)}")
+                            self.after(0, lambda m=mid, c=ch, cc=calib: self._update_ftdac_cell(int(m), int(c), int(cc)))
+
+                        # After each channel: turn it back OFF and disable TDCON, so only the
+                        # currently-calibrated channel stays active.
+                        try:
+                            self.hw.AnalogChannelOFF(quad, mattonella=int(mid), canale=int(ch))
+                        except Exception:
+                            pass
+                        try:
+                            self.hw.EnableTDC(quad, Mattonella=int(mid), enable=False)
+                        except Exception:
+                            pass
+
+                # Restore state for verification: enable PIXON + TDCON for all pixels of the block.
+                self.after(0, lambda: status.set("Ripristino: riaccendi PIXON+TDCON per tutto il blocco…"))
+                for mid in mats:
+                    if stop_evt.is_set():
+                        return
+                    if 4 <= int(mid) <= 7:
+                        continue
+                    try:
+                        self.hw.EnableTDC(quad, Mattonella=int(mid), enable=True)
+                    except Exception:
+                        pass
+                    for ch in range(64):
+                        if stop_evt.is_set():
+                            return
+                        try:
+                            self.hw.AnalogChannelON(quad, mattonella=int(mid), canale=int(ch))
+                        except Exception:
+                            pass
+
+                self.after(0, lambda: status.set("FINE: calibrazione blocco completata."))
+                log("DONE: block calibration completed.")
+            except Exception as e:
+                self.after(0, lambda e=e: status.set(f"ERRORE: {e}"))
+                self.after(0, lambda e=e: log(f"ERROR: {e!r}"))
+
+        def start() -> None:
+            stop_evt.clear()
+            threading.Thread(target=worker, daemon=True).start()
+
+        def stop() -> None:
+            stop_evt.set()
+            status.set("Stop richiesto…")
+
+        btns = ttk.Frame(root)
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="Start", command=start).pack(side="left")
+        ttk.Button(btns, text="Stop", command=stop).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="FIFO popup…", command=lambda: self._open_fifo_popup(quad)).pack(side="right")
+
+        def on_close() -> None:
+            stop_evt.set()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     def _build_mat_mini(self, parent: ttk.Frame, mat_id: int, *, title: str) -> ttk.Frame:
         frm = ttk.Labelframe(parent, text=title, padding=4)
@@ -2434,16 +3772,512 @@ class Ignite64Gui(tk.Tk):
             col = int(x / c_w)
             row = int(y / c_h)
             if 0 <= row < 8 and 0 <= col < 8:
+                self._open_ftdac_popup(int(mid), row * 8 + col)
+
+        def on_right_click(ev: tk.Event) -> None:
+            # Keep old behavior available: right-click toggles PIXON.
+            g = getattr(cv, "_mat_grid_geom", None)
+            if not g:
+                return
+            mid, gx0, gy0, c_w, c_h, _gap = g
+            x = float(ev.x) - gx0
+            y = float(ev.y) - gy0
+            if x < 0 or y < 0:
+                return
+            col = int(x / c_w)
+            row = int(y / c_h)
+            if 0 <= row < 8 and 0 <= col < 8:
                 self._toggle_pixel_block(int(mid), row * 8 + col)
 
         cv.bind("<Configure>", redraw_pixels)
         cv.bind("<Button-1>", on_click)
+        cv.bind("<Button-3>", on_right_click)
         redraw_pixels()
 
         return frm
 
+    def _update_ftdac_cell(self, mat_id: int, pix_id: int, code: int) -> None:
+        canvas = self._block_pix_canvas.get(int(mat_id))
+        txts = self._block_pix_txt_ids.get(int(mat_id)) or []
+        if canvas is not None and pix_id < len(txts) and txts[pix_id]:
+            try:
+                canvas.itemconfigure(txts[pix_id], text=str(int(code)))
+            except tk.TclError:
+                pass
+        # Keep FILE-prefilled cache coherent with GUI edits.
+        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+            qkey = str(self.quad_var.get()).strip().upper()
+            entry = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
+            if isinstance(entry, dict):
+                ft = entry.get("ftdac")
+                if isinstance(ft, list) and pix_id < len(ft):
+                    ft[pix_id] = int(code) & 0x0F
+
+    def _update_pixel_fill_state(self, mat_id: int, pix_id: int, *, pix_on: bool, fe_on: bool) -> None:
+        """
+        Color policy for block pixels:
+        - FEON=0 -> gray (channel effectively off regardless of PIXON)
+        - FEON=1 -> green if PIXON=1 else red
+        """
+        canvas = self._block_pix_canvas.get(int(mat_id))
+        rects = self._block_pix_cells.get(int(mat_id))
+        if canvas is not None and rects and int(pix_id) < len(rects):
+            if not bool(fe_on):
+                fill = "#bdbdbd"
+            else:
+                fill = "#1f9d55" if bool(pix_on) else "#aa2222"
+            try:
+                canvas.itemconfigure(rects[int(pix_id)], fill=fill)
+            except tk.TclError:
+                pass
+
+        # Keep FILE-prefilled cache coherent for PIXON (FEON not represented in cache today).
+        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+            qkey = str(self.quad_var.get()).strip().upper()
+            entry = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
+            if isinstance(entry, dict):
+                po = entry.get("pix_on")
+                if isinstance(po, list) and int(pix_id) < len(po):
+                    po[int(pix_id)] = bool(pix_on)
+
+    def _open_ftdac_popup(self, mat_id: int, pix_id: int) -> None:
+        quad = self.quad_var.get()
+        if 4 <= int(mat_id) <= 7:
+            self._set_status(f"MAT {mat_id}: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"FTDAC — Q={quad} MAT={mat_id} PIX={pix_id}")
+        win.transient(self)
+        win.resizable(False, False)
+
+        cur_var = tk.StringVar(value="?")
+        set_var = tk.StringVar(value="")
+        delta_var = tk.StringVar(value="1")
+        pix_on_var = tk.StringVar(value="?")
+        tdc_on_var = tk.StringVar(value="?")
+        both_var = tk.BooleanVar(value=False)
+
+        hdr = ttk.Frame(win, padding=10)
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text=f"Quadrant {quad}  |  MAT {mat_id}  |  Pixel {pix_id}", font=("Segoe UI", 11, "bold")).pack(
+            anchor="w"
+        )
+
+        row = ttk.Frame(win, padding=(10, 0))
+        row.pack(fill="x", pady=(6, 0))
+        ttk.Label(row, text="FTCODE =", width=12).pack(side="left")
+        tk.Label(row, textvariable=cur_var, font=("Segoe UI", 12, "bold")).pack(side="left")
+
+        row2 = ttk.Frame(win, padding=(10, 0))
+        row2.pack(fill="x", pady=(10, 0))
+        ttk.Label(row2, text="Set to:", width=12).pack(side="left")
+        e_set = ttk.Entry(row2, width=6, textvariable=set_var)
+        e_set.pack(side="left")
+
+        state_box = ttk.Labelframe(win, text="Channel enable", padding=(10, 6))
+        state_box.pack(fill="x", padx=10, pady=(10, 0))
+        st1 = ttk.Frame(state_box)
+        st1.pack(fill="x")
+        ttk.Label(st1, text="PIXON:", width=8).pack(side="left")
+        ttk.Label(st1, textvariable=pix_on_var, width=6).pack(side="left")
+        ttk.Label(st1, text="TDCON:", width=8).pack(side="left", padx=(12, 0))
+        ttk.Label(st1, textvariable=tdc_on_var, width=6).pack(side="left")
+        ttk.Label(st1, text="FEON:", width=8).pack(side="left", padx=(12, 0))
+        fe_on_var = tk.StringVar(value="?")
+        ttk.Label(st1, textvariable=fe_on_var, width=6).pack(side="left")
+        feon_flag = tk.BooleanVar(value=False)
+
+        def _update_pixel_fill(on: bool) -> None:
+            # Backward-compatible helper: reads FEON and applies color policy.
+            try:
+                fe = bool(self.hw.readAnalogFEON(quad, mattonella=int(mat_id), canale=int(pix_id)))
+            except Exception:
+                fe = True
+            self._update_pixel_fill_state(int(mat_id), int(pix_id), pix_on=bool(on), fe_on=bool(fe))
+
+        def _read_states() -> None:
+            def do() -> dict[str, bool]:
+                self.hw.select_quadrant(quad)
+                p = bool(self.hw.readAnalogChannelON(quad, mattonella=int(mat_id), canale=int(pix_id)))
+                t = bool(self.hw.readEnableTDC(quad, Mattonella=int(mat_id))["tdc_on"])
+                f = bool(self.hw.readAnalogFEON(quad, mattonella=int(mat_id), canale=int(pix_id)))
+                return {"pix_on": p, "tdc_on": t, "fe_on": f}
+
+            r = self._with_hw(do, busy=f"Read PIXON/TDC (Q={quad} MAT={mat_id} PIX={pix_id})")
+            if not isinstance(r, dict):
+                return
+            p = bool(r.get("pix_on", False))
+            t = bool(r.get("tdc_on", False))
+            f = bool(r.get("fe_on", False))
+            pix_on_var.set("ON" if p else "OFF")
+            tdc_on_var.set("ON" if t else "OFF")
+            fe_on_var.set("ON" if f else "OFF")
+            both_var.set(bool(p and t))
+            feon_flag.set(bool(f))
+
+        def _apply_both(enable: bool) -> None:
+            def do() -> dict[str, bool]:
+                self.hw.select_quadrant(quad)
+                # PIXON per-channel
+                if bool(enable):
+                    self.hw.AnalogChannelON(quad, mattonella=int(mat_id), canale=int(pix_id))
+                else:
+                    self.hw.AnalogChannelOFF(quad, mattonella=int(mat_id), canale=int(pix_id))
+                # TDCON is MAT-level
+                self.hw.EnableTDC(quad, Mattonella=int(mat_id), enable=bool(enable))
+                p = bool(self.hw.readAnalogChannelON(quad, mattonella=int(mat_id), canale=int(pix_id)))
+                t = bool(self.hw.readEnableTDC(quad, Mattonella=int(mat_id))["tdc_on"])
+                return {"pix_on": p, "tdc_on": t}
+
+            r = self._with_hw(do, busy=f"Set PIXON+TDC={'ON' if enable else 'OFF'} (Q={quad} MAT={mat_id} PIX={pix_id})")
+            if not isinstance(r, dict):
+                return
+            p = bool(r.get("pix_on", False))
+            t = bool(r.get("tdc_on", False))
+            pix_on_var.set("ON" if p else "OFF")
+            tdc_on_var.set("ON" if t else "OFF")
+            both_var.set(bool(p and t))
+            _update_pixel_fill(p)
+
+        def _apply_feon(enable: bool) -> None:
+            def do() -> bool:
+                self.hw.select_quadrant(quad)
+                self.hw.setAnalogFEON(quad, mattonella=int(mat_id), canale=int(pix_id), on=bool(enable))
+                return bool(self.hw.readAnalogFEON(quad, mattonella=int(mat_id), canale=int(pix_id)))
+
+            v = self._with_hw(do, busy=f"Set FEON={'ON' if enable else 'OFF'} (Q={quad} MAT={mat_id} PIX={pix_id})")
+            if v is None:
+                return
+            feon_flag.set(bool(v))
+            fe_on_var.set("ON" if bool(v) else "OFF")
+            # Update pixel fill immediately according to FEON+PIXON.
+            try:
+                p = bool(self.hw.readAnalogChannelON(quad, mattonella=int(mat_id), canale=int(pix_id)))
+            except Exception:
+                p = False
+            self._update_pixel_fill_state(int(mat_id), int(pix_id), pix_on=p, fe_on=bool(v))
+
+        ttk.Checkbutton(
+            state_box,
+            text="Enable channel (PIXON + TDCON)",
+            variable=both_var,
+            command=lambda: _apply_both(bool(both_var.get())),
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Checkbutton(
+            state_box,
+            text="FEON (ENPOW)",
+            variable=feon_flag,
+            command=lambda: _apply_feon(bool(feon_flag.get())),
+        ).pack(anchor="w", pady=(2, 0))
+
+        def _read_cur() -> None:
+            def do() -> int:
+                return int(self.hw.readAnalogChannelFineTune(quad, mattonella=int(mat_id), canale=int(pix_id)))
+
+            v = self._with_hw(do, busy=f"Read FTDAC (Q={quad} MAT={mat_id} PIX={pix_id})")
+            if v is None:
+                return
+            cur_var.set(str(int(v)))
+            _read_states()
+
+        def _apply(code: int) -> None:
+            code = int(code)
+            if code < 0:
+                code = 0
+            if code > 15:
+                code = 15
+
+            def do() -> int:
+                self.hw.AnalogChannelFineTune(quad, block=0, mattonella=int(mat_id), canale=int(pix_id), valore=int(code))
+                return int(self.hw.readAnalogChannelFineTune(quad, mattonella=int(mat_id), canale=int(pix_id)))
+
+            v = self._with_hw(do, busy=f"Set FTDAC={code} (Q={quad} MAT={mat_id} PIX={pix_id})")
+            if v is None:
+                return
+            cur_var.set(str(int(v)))
+            self._update_ftdac_cell(int(mat_id), int(pix_id), int(v))
+
+        def _on_set() -> None:
+            try:
+                _apply(int(str(set_var.get()).strip()))
+            except Exception:
+                self._set_status("FTDAC: inserire un numero 0..15")
+
+        btns = ttk.Frame(win, padding=(10, 10))
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Refresh", command=_read_cur).pack(side="left")
+        ttk.Button(btns, text="Set", command=_on_set).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Calibra canale…", command=lambda: self._calib_pixel_threshold(mat_id, pix_id)).pack(
+            side="right"
+        )
+
+        step_row = ttk.Frame(win, padding=(10, 0))
+        step_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(step_row, text="Δ:", width=12).pack(side="left")
+        ttk.Entry(step_row, width=6, textvariable=delta_var).pack(side="left")
+
+        def _delta(sign: int) -> None:
+            try:
+                d = int(str(delta_var.get()).strip())
+            except Exception:
+                d = 1
+            if d <= 0:
+                d = 1
+            try:
+                cur = int(str(cur_var.get()).strip())
+            except Exception:
+                _read_cur()
+                try:
+                    cur = int(str(cur_var.get()).strip())
+                except Exception:
+                    return
+            _apply(cur + int(sign) * int(d))
+
+        ttk.Button(step_row, text="+Δ", command=lambda: _delta(+1)).pack(side="left", padx=(10, 4))
+        ttk.Button(step_row, text="-Δ", command=lambda: _delta(-1)).pack(side="left")
+
+        # Better UX: ENTER in "Set to" triggers Set
+        e_set.bind("<Return>", lambda _ev: _on_set())
+
+        _read_cur()
+
+    def _calib_pixel_threshold(self, mat_id: int, pix_id: int) -> None:
+        """
+        Experimental: calibrate a single pixel threshold by sweeping FTDAC down until a FIFO hit appears.
+        When the first hit is detected, we store the *previous* code (one step above) as calibrated.
+        """
+        quad = str(self.quad_var.get()).strip().upper()
+        if 4 <= int(mat_id) <= 7:
+            self._set_status(f"MAT {mat_id}: calibrazione disabilitata (I2C stack issue).")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Calibrazione soglia — Q={quad} MAT={mat_id} PIX={pix_id}")
+        win.transient(self)
+        win.resizable(True, True)
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill="both", expand=True)
+
+        info = ttk.Label(
+            root,
+            text=(
+                "Procedura: diminuisce FTCODE (FTDAC) fino a quando compare un hit in FIFO.\n"
+                "Al primo hit, imposta il codice precedente e termina."
+            ),
+            font=("Segoe UI", 9),
+            justify="left",
+        )
+        info.pack(anchor="w", pady=(0, 8))
+
+        params = ttk.Labelframe(root, text="Parametri", padding=8)
+        params.pack(fill="x", pady=(0, 8))
+
+        start_code = tk.StringVar(value="")
+        step_code = tk.StringVar(value="1")
+        min_code = tk.StringVar(value="0")
+        settle_ms = tk.StringVar(value="5")
+        poll_ms = tk.StringVar(value="50")
+        polls_per_step = tk.StringVar(value="10")
+
+        def _row(r: int, label: str, var: tk.StringVar) -> None:
+            ttk.Label(params, text=label, width=18).grid(row=r, column=0, sticky="w")
+            ttk.Entry(params, textvariable=var, width=8).grid(row=r, column=1, sticky="w", padx=(6, 0))
+
+        _row(0, "Start FTCODE:", start_code)
+        _row(1, "Step Δ:", step_code)
+        _row(2, "Min FTCODE:", min_code)
+        _row(3, "Settle (ms):", settle_ms)
+        _row(4, "Poll every (ms):", poll_ms)
+        _row(5, "Polls/step:", polls_per_step)
+
+        status = tk.StringVar(value="—")
+        ttk.Label(root, textvariable=status, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+
+        out = tk.Text(root, height=14, width=80, wrap="none", state="disabled")
+        yscroll = ttk.Scrollbar(root, orient="vertical", command=out.yview)
+        out.configure(yscrollcommand=yscroll.set)
+        out.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        stop_evt = threading.Event()
+
+        def log(msg: str) -> None:
+            self._fifo_log(out, msg)
+
+        # On entering calibration: enable the channel (PIXON + FEON) and enable TDCON for this MAT,
+        # and default start FTCODE to 15.
+        try:
+            start_code.set("15")
+        except Exception:
+            pass
+
+        def _prepare_channel() -> None:
+            def do() -> None:
+                self.hw.select_quadrant(quad)
+                self.hw.setAnalogFEON(quad, mattonella=int(mat_id), canale=int(pix_id), on=True)
+                self.hw.AnalogChannelON(quad, mattonella=int(mat_id), canale=int(pix_id))
+                self.hw.EnableTDC(quad, Mattonella=int(mat_id), enable=True)
+
+            # Best-effort: don't block popup; errors will be visible in status/log.
+            try:
+                self._with_hw(do, busy=f"Prep calib (PIXON+FEON+TDCON) (Q={quad} MAT={mat_id} PIX={pix_id})")
+            except Exception:
+                pass
+
+        self.after(50, _prepare_channel)
+
+        def fifo_hit_once() -> bool:
+            """
+            Return True if we see a non-empty FIFO word (according to embedded empty flag),
+            otherwise False.
+            """
+            try:
+                w = int(self.hw.FifoReadSingleRobust(quad=quad, retries=12, backoff_s=0.003, do_bus_recovery=True))
+            except Exception as e:
+                # Don't abort calibration for a single glitch; just log and treat as "no hit" this poll.
+                log(f"FIFO read error: {e!r}")
+                return False
+            if w == 0:
+                return False
+            try:
+                d = self._fifo_decode_word(w)
+                if int(d.get("fifo_empty", 0)) == 1 and int(d.get("fifo_cnt", 0)) == 0:
+                    return False
+                # Log the decoded info for the operator.
+                log(
+                    f"HIT: MAT={d['mat']:2d} CH={d['channel']:2d} "
+                    f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}"
+                )
+                return True
+            except Exception:
+                log(f"HIT: 0x{w:016X}")
+                return True
+
+        def worker() -> None:
+            try:
+                self._fifo_ensure_i2c()
+                self.hw.select_quadrant(quad)
+
+                # Read current code if Start empty.
+                sc_raw = str(start_code.get()).strip()
+                if not sc_raw:
+                    try:
+                        cur = int(self.hw.readAnalogChannelFineTune(quad, mattonella=int(mat_id), canale=int(pix_id)))
+                    except Exception:
+                        cur = 15
+                else:
+                    cur = int(sc_raw)
+                if cur < 0:
+                    cur = 0
+                if cur > 15:
+                    cur = 15
+
+                step = int(str(step_code.get()).strip() or "1")
+                if step <= 0:
+                    step = 1
+                mn = int(str(min_code.get()).strip() or "0")
+                if mn < 0:
+                    mn = 0
+                if mn > 15:
+                    mn = 15
+
+                st_ms = int(str(settle_ms.get()).strip() or "5")
+                if st_ms < 0:
+                    st_ms = 0
+                if st_ms < 5:
+                    st_ms = 5
+                p_ms = int(str(poll_ms.get()).strip() or "50")
+                if p_ms < 1:
+                    p_ms = 1
+                if p_ms < 5:
+                    p_ms = 5
+                n_polls = int(str(polls_per_step.get()).strip() or "10")
+                if n_polls < 1:
+                    n_polls = 1
+
+                # Drain residual FIFO once at start.
+                try:
+                    _ = self.hw.FifoDrain(max_words=128)
+                except Exception:
+                    pass
+
+                prev_code = cur
+                self.after(0, lambda: status.set(f"Calibrazione in corso… start={cur} step={step} min={mn}"))
+                self.after(0, lambda: log(f"START: current FTCODE={cur}"))
+
+                code = cur
+                while code >= mn and not stop_evt.is_set():
+                    # Set code
+                    self.hw.AnalogChannelFineTune(quad, block=0, mattonella=int(mat_id), canale=int(pix_id), valore=int(code))
+                    # Update UI in popup immediately
+                    self.after(0, lambda c=code: status.set(f"FTCODE={c} → polling FIFO…"))
+                    self.after(0, lambda c=code: log(f"SET FTCODE={c}"))
+                    if st_ms:
+                        time.sleep(float(st_ms) / 1000.0)
+
+                    hit = False
+                    for _i in range(n_polls):
+                        if stop_evt.is_set():
+                            break
+                        if fifo_hit_once():
+                            hit = True
+                            break
+                        time.sleep(float(p_ms) / 1000.0)
+
+                    if hit:
+                        # Calibrated = previous code (one step above the first-hit code)
+                        calib = int(prev_code)
+                        if calib < 0:
+                            calib = 0
+                        if calib > 15:
+                            calib = 15
+                        self.hw.AnalogChannelFineTune(
+                            quad, block=0, mattonella=int(mat_id), canale=int(pix_id), valore=int(calib)
+                        )
+                        self.after(0, lambda c=calib: status.set(f"CALIBRATO: FTCODE={c} (hit a {code})"))
+                        self.after(0, lambda c=calib: log(f"DONE: calibrated FTCODE={c} (hit at {code})"))
+                        # Update block mini view numbers/colors
+                        self.after(0, lambda c=calib: self._update_ftdac_cell(int(mat_id), int(pix_id), int(c)))
+                        return
+
+                    prev_code = code
+                    code -= step
+
+                self.after(0, lambda: status.set("STOP: nessun hit (raggiunto min o interrotto)."))
+                self.after(0, lambda: log("STOP: no hit"))
+            except Exception as e:
+                self.after(0, lambda e=e: status.set(f"ERRORE: {e}"))
+                self.after(0, lambda e=e: log(f"ERROR: {e!r}"))
+
+        def start() -> None:
+            stop_evt.clear()
+            threading.Thread(target=worker, daemon=True).start()
+
+        def stop() -> None:
+            stop_evt.set()
+            status.set("Stop richiesto…")
+
+        btns = ttk.Frame(root)
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="Start", command=start).pack(side="left")
+        ttk.Button(btns, text="Stop", command=stop).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="FIFO popup…", command=lambda: self._open_fifo_popup(quad)).pack(side="right")
+
+        def on_close() -> None:
+            stop_evt.set()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
     def _toggle_pixel_block(self, mat_id: int, pix_id: int) -> None:
         quad = self.quad_var.get()
+        # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+        if 4 <= int(mat_id) <= 7:
+            self._set_status(f"MAT {mat_id}: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            _dbg(f"toggle pixel blocked: MAT {mat_id} in [4..7] (known I2C stack issue)")
+            return
 
         def do() -> bool:
             self.hw.select_quadrant(quad)
@@ -2457,39 +4291,184 @@ class Ignite64Gui(tk.Tk):
         new_state = self._with_hw(do, busy=f"Toggling pixel {pix_id} (Q={quad} MAT={mat_id})")
         if new_state is None:
             return
-        canvas = self._block_pix_canvas.get(mat_id)
-        rects = self._block_pix_cells.get(mat_id)
-        if canvas is not None and rects and pix_id < len(rects):
-            fill = "#1f9d55" if new_state else "#aa2222"
-            try:
-                canvas.itemconfigure(rects[pix_id], fill=fill)
-            except tk.TclError:
-                pass
+        try:
+            fe = bool(self.hw.readAnalogFEON(quad, mattonella=int(mat_id), canale=int(pix_id)))
+        except Exception:
+            fe = True
+        self._update_pixel_fill_state(int(mat_id), int(pix_id), pix_on=bool(new_state), fe_on=bool(fe))
+
+        # Keep FILE-prefilled cache coherent with GUI toggles.
+        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+            qkey = str(quad).strip().upper()
+            entry = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
+            if isinstance(entry, dict):
+                po = entry.get("pix_on")
+                if isinstance(po, list) and pix_id < len(po):
+                    po[pix_id] = bool(new_state)
+
         self._set_status(f"Pixel {pix_id}={'ON' if new_state else 'OFF'} (Q={quad} MAT={mat_id})")
+
+    def _set_block_all(self, block_id: int, *, feon: Optional[bool] = None, pixon: Optional[bool] = None, tdcon: Optional[bool] = None) -> None:
+        quad = self.quad_var.get()
+        mats = self.mapping.mats_in_block(block_id)
+
+        def do() -> None:
+            self.hw.select_quadrant(quad)
+            for mid in mats:
+                if 4 <= int(mid) <= 7:
+                    continue
+                if tdcon is not None:
+                    self.hw.EnableTDC(quad, Mattonella=int(mid), enable=bool(tdcon))
+                if feon is not None or pixon is not None:
+                    for ch in range(64):
+                        if feon is not None:
+                            self.hw.setAnalogFEON(quad, mattonella=int(mid), canale=int(ch), on=bool(feon))
+                        if pixon is not None:
+                            if bool(pixon):
+                                self.hw.AnalogChannelON(quad, mattonella=int(mid), canale=int(ch))
+                            else:
+                                self.hw.AnalogChannelOFF(quad, mattonella=int(mid), canale=int(ch))
+
+        self._with_hw(do, busy=f"Apply ALL (block={block_id} quad={str(quad).strip().upper()})")
+        # Refresh this block view (updates canvas fills and ftdac labels).
+        try:
+            self._refresh_block(block_id)
+        except Exception:
+            pass
+
+    def _iref_sync_for_quad(self, quad: str) -> None:
+        q = str(quad).strip().upper()
+        if q not in self._iref_last_mv_by_quad:
+            return
+        try:
+            self._iref_var.set(f"{float(self._iref_last_mv_by_quad[q]):.6g}")
+        except Exception:
+            pass
+
+    def _iref_read(self, quad: Optional[str] = None) -> None:
+        # External IREF DAC is write-only; show last value set (C# behavior).
+        q = str(quad or self.quad_var.get()).strip().upper()
+        self._iref_sync_for_quad(q)
+        try:
+            self._set_status(f"IREF (cached, quad={q}) = {float(self._iref_last_mv_by_quad.get(q, 0.0)):.6g} mV")
+        except Exception:
+            self._set_status(f"IREF (cached, quad={q})")
+
+    def _iref_set(self, quad: str, value_s: str) -> None:
+        try:
+            v = float(str(value_s).strip())
+        except Exception:
+            self._set_status("IREF: valore non numerico (mV)")
+            return
+        if v < 0:
+            v = 0.0
+
+        # Use current VDDA (mV) if available; otherwise fall back to 1200 mV like C# default max.
+        try:
+            vdda_mv = float(str(getattr(self, "_vdda_var", tk.StringVar(value="")).get()).strip())
+            if vdda_mv <= 0:
+                raise ValueError()
+        except Exception:
+            vdda_mv = 1200.0
+
+        q = str(quad).strip().upper()
+        if q not in {"SW", "NW", "SE", "NE"}:
+            self._set_status("IREF: quad non valido (SW/NW/SE/NE)")
+            return
+
+        def do() -> dict[str, object]:
+            self.hw.select_quadrant(q)
+            self.hw.AnalogSetIREF(v, vdda_mv=float(vdda_mv))
+            # Optional physical confirmation: measure V_Iref via Quad ADC channel 7.
+            meas = None
+            try:
+                meas = self.hw._adc_quad_oneshot(channel=7, gain=0, res_bits=16, delay_s=0.01)  # type: ignore[attr-defined]
+            except Exception:
+                meas = None
+            return {"set_mv": float(v), "vdda_mv": float(vdda_mv), "meas": meas}
+
+        r = self._with_hw(do, busy=f"Set IREF={v} mV (VDDA={float(vdda_mv):.6g} mV)")
+        if not isinstance(r, dict):
+            return
+        self._iref_last_mv_by_quad[q] = float(r.get("set_mv", v))
+        try:
+            self._iref_var.set(f"{float(self._iref_last_mv_by_quad[q]):.6g}")
+        except Exception:
+            pass
+        meas = r.get("meas")
+        if isinstance(meas, dict):
+            try:
+                mv = float(meas.get("value_mv"))  # type: ignore[arg-type]
+                vv = float(meas.get("value"))  # type: ignore[arg-type]
+                self._iref_meas_var.set(f"ADC V_Iref: {vv:.6g} V / {mv:.6g} mV")
+            except Exception:
+                pass
+        self._set_status(
+            f"IREF set={float(self._iref_last_mv_by_quad[q]):.6g} mV (quad={q}, scaled by VDDA={float(vdda_mv):.6g} mV)"
+        )
 
     def _refresh_mat_mini(self, mat_id: int) -> None:
         quad = self.quad_var.get()
+        qkey = str(quad).strip().upper()
 
-        # Se abbiamo fatto uno snapshot di avvio, usalo per rendere immediata la view.
-        cached: Optional[dict[str, object]] = None
-        if self._mat_snapshot_prefill_active:
-            cached = self._mat_snapshot_cache.get(str(quad).strip().upper(), {}).get(int(mat_id))
-
-        if isinstance(cached, dict):
-            pix_on = cached.get("pix_on")
-            ftdac = cached.get("ftdac")
+        # Known chip/bus issue: MAT 4..7 must NEVER be accessed directly.
+        # Always render them from cache / synthesized state.
+        if 4 <= int(mat_id) <= 7:
+            qc = self._mat_snapshot_cache.setdefault(qkey, {})
+            ent = qc.get(int(mat_id))
+            if not isinstance(ent, dict):
+                ent = {}
+                qc[int(mat_id)] = ent
+            po = ent.get("pix_on")
+            fo = ent.get("fe_on")
+            ft = ent.get("ftdac")
+            if not isinstance(po, list) or len(po) < 64:
+                po = [False] * 64
+            if not isinstance(fo, list) or len(fo) < 64:
+                fo = [True] * 64
+            if not isinstance(ft, list) or len(ft) < 64:
+                ft = [0] * 64
+            # If quadrant ALL toggles exist, use them as best-effort truth.
+            v = self._quad_all_vars.get(qkey, {})
+            try:
+                if "px" in v and isinstance(v["px"], tk.BooleanVar):
+                    po = [bool(v["px"].get())] * 64
+            except Exception:
+                pass
+            try:
+                if "fe" in v and isinstance(v["fe"], tk.BooleanVar):
+                    fo = [bool(v["fe"].get())] * 64
+            except Exception:
+                pass
+            ent["pix_on"] = po
+            ent["fe_on"] = fo
+            ent["ftdac"] = ft
+            pix_on, fe_on, ftdac = po, fo, ft
         else:
-            def do() -> dict[str, object]:
-                return self.hw.readMatPixelsAndFTDAC(quad, mattonella=mat_id)
 
-            r = self._with_hw(do, busy=f"Refreshing MAT {mat_id} (Q={quad})")
-            if r is None or not isinstance(r, dict):
-                return
-            pix_on = r.get("pix_on")
-            ftdac = r.get("ftdac")
+            # Se abbiamo fatto uno snapshot di avvio, usalo per rendere immediata la view.
+            cached: Optional[dict[str, object]] = None
+            if self._mat_snapshot_prefill_active:
+                cached = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
+
+            if isinstance(cached, dict):
+                pix_on = cached.get("pix_on")
+                fe_on = cached.get("fe_on")
+                ftdac = cached.get("ftdac")
+            else:
+                def do() -> dict[str, object]:
+                    return self.hw.readMatPixelsAndFTDAC(quad, mattonella=mat_id)
+
+                r = self._with_hw(do, busy=f"Refreshing MAT {mat_id} (Q={quad})")
+                if r is None or not isinstance(r, dict):
+                    return
+                pix_on = r.get("pix_on")
+                fe_on = r.get("fe_on")
+                ftdac = r.get("ftdac")
 
         if not (
             isinstance(pix_on, list)
+            and (fe_on is None or isinstance(fe_on, list))
             and isinstance(ftdac, list)
             and len(pix_on) == 64
             and len(ftdac) == 64
@@ -2502,12 +4481,9 @@ class Ignite64Gui(tk.Tk):
         txts = self._block_pix_txt_ids.get(mat_id) or []
         for pix in range(64):
             on = bool(pix_on[pix])
+            fe = True if not isinstance(fe_on, list) else bool(fe_on[pix])
             code = int(ftdac[pix])
-            fill = "#1f9d55" if on else "#aa2222"
-            try:
-                canvas.itemconfigure(rects[pix], fill=fill)
-            except tk.TclError:
-                pass
+            self._update_pixel_fill_state(int(mat_id), int(pix), pix_on=on, fe_on=fe)
             if pix < len(txts) and txts[pix]:
                 try:
                     canvas.itemconfigure(txts[pix], text=str(code))
@@ -2518,16 +4494,64 @@ class Ignite64Gui(tk.Tk):
         quad = self.quad_var.get()
         mats = self.mapping.mats_in_block(block_id)
         self._set_status(f"Refreshing block {block_id} (Q={quad})")
+
+        # Cancel pending cache-disable to keep snapshot consistent across rapid opens/resize refreshes.
+        if self._mat_snapshot_disable_after_id is not None:
+            try:
+                self.after_cancel(self._mat_snapshot_disable_after_id)
+            except Exception:
+                pass
+            self._mat_snapshot_disable_after_id = None
+
+        # Debug: capire se lo snapshot pre-caricato viene davvero usato.
+        if self._mat_snapshot_prefill_active and not self.offline:
+            qkey = str(quad).strip().upper()
+            cached_for_quad = self._mat_snapshot_cache.get(qkey, {})
+            hit = sum(1 for mid in mats if int(mid) in cached_for_quad)
+            _dbg(f"Block refresh {block_id} (quad={qkey}) prefill_active=1 cache_hit={hit}/{len(mats)}")
+            for mid in mats:
+                _dbg(
+                    f"  MAT {int(mid)} cache={'hit' if int(mid) in cached_for_quad else 'miss'} (prefill={self._mat_snapshot_prefill_active})"
+                )
+        else:
+            if not self.offline:
+                _dbg(f"Block refresh {block_id} (quad={str(quad).strip().upper()}) prefill_active=0")
+
         for mat_id in mats:
             self._refresh_mat_mini(mat_id)
         # refresh analog mini (uses the same underlying refresh function)
-        try:
-            self._refresh_analog(block_id)
-        except Exception:
-            pass
-        # Dopo la prima apertura/sincronizzazione di una block view, non riusare più la cache
-        # (per evitare discrepanze se l'hardware cambia).
-        self._mat_snapshot_prefill_active = False
+        # When prefilled from file, don't block opening the page on HW I2C (mux can "stack").
+        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
+            _dbg(f"Skipping analog refresh on block open (file-prefill active) block={block_id} quad={str(quad).strip().upper()}")
+        else:
+            try:
+                self._refresh_analog(block_id)
+            except Exception:
+                pass
+
+        # Gestione disattivazione cache:
+        # - se la cache è pre-riempita DA FILE, mantenendola attiva evitiamo letture HW ripetute e
+        #   la GUI resta coerente col file.
+        # - se invece la cache viene da snapshot "hardware", la disattiviamo dopo la prima apertura
+        #   per evitare discrepanze se l'hardware cambia.
+        if not getattr(self, "_mat_snapshot_prefill_from_file", False):
+            # Dopo la prima apertura/sincronizzazione di una block view, non riusare più la cache
+            # (per evitare discrepanze se l'hardware cambia).
+            # Però: durante l'apertura ci sono refresh automatici (resize/Configure). Tenere attiva la
+            # cache per una breve finestra evita letture HW ripetute e rende "snapshot" più immediato.
+            if self._mat_snapshot_disable_after_id is not None:
+                try:
+                    self.after_cancel(self._mat_snapshot_disable_after_id)
+                except Exception:
+                    pass
+                self._mat_snapshot_disable_after_id = None
+
+            def _disable_cache() -> None:
+                self._mat_snapshot_prefill_active = False
+                self._mat_snapshot_disable_after_id = None
+                _dbg("mat snapshot prefill flag disabled (grace period over)")
+
+            self._mat_snapshot_disable_after_id = self.after(350, _disable_cache)
         self._set_status(f"Block {block_id} refreshed (Q={quad})")
 
     def _build_analog_mini(self, parent: ttk.Frame, block_id: int, *, kind: str) -> ttk.Frame:
@@ -2554,10 +4578,14 @@ class Ignite64Gui(tk.Tk):
             fg=hdr_fg,
             anchor="w",
             padx=6,
-            pady=4,
+            pady=3,
             font=("Segoe UI", 9, "bold"),
         )
-        hdr.pack(fill="x", pady=(0, 6))
+        hdr.pack(fill="x", pady=(0, 4))
+
+        bar = ttk.Frame(frm)
+        bar.pack(fill="x", pady=(0, 4))
+        ttk.Button(bar, text="Read", command=lambda: self._refresh_analog(block_id)).pack(side="left")
 
         # Blocchi LP: correnti AFE (reg68: I_DISC + I_CSA 3 bit ciascuno; reg69 low nibble I_KRUM 4 bit).
         if is_lp:
@@ -2584,16 +4612,29 @@ class Ignite64Gui(tk.Tk):
         self._dac_vars = {}
         self._dac_en_vars = {}
         self._dac_meas_vars = {}
+        self._dac_set_vars: dict[str, tk.StringVar] = {}
         self._vinjh_var = tk.StringVar(value="?")
         self._vinjl_var = tk.StringVar(value="?")
         self._c2p_var = tk.BooleanVar(value=False)
         self._vdda_var = tk.StringVar(value="?")
+        # Keep references to mux buttons to highlight selected state.
+        self._vinj_btns = {"VinjH": {}, "VinjL": {}}
 
-        # DAC boxes
+        # DAC controls (compact 2-column layout)
         dacs = ["VTHR_H", "VTHR_L", "VINJ_H", "VINJ_L", "VLDO", "VFB"]
-        for name in dacs:
-            box = ttk.Labelframe(frm, text=name, padding=3)
-            box.pack(fill="x", pady=2)
+        dac_grid = ttk.Frame(frm)
+        dac_grid.pack(fill="x", pady=(0, 2))
+        for c in (0, 1):
+            dac_grid.grid_columnconfigure(c, weight=1, uniform="daccol")
+
+        bold_code_font = ("Segoe UI", 10, "bold")
+        meas_font = ("Segoe UI", 8)
+
+        for i, name in enumerate(dacs):
+            r, c = divmod(i, 2)
+            cell = ttk.Frame(dac_grid, padding=(2, 1))
+            cell.grid(row=r, column=c, sticky="ew", padx=(0, 6) if c == 0 else (0, 0), pady=(0, 2))
+
             v = tk.StringVar(value="?")
             self._dac_vars[name] = v
             en = tk.BooleanVar(value=False)
@@ -2601,40 +4642,56 @@ class Ignite64Gui(tk.Tk):
             mv = tk.StringVar(value="")
             self._dac_meas_vars[name] = mv
 
-            top = ttk.Frame(box)
+            top = ttk.Frame(cell)
             top.pack(fill="x")
-            ttk.Label(top, text="code:", width=5).pack(side="left")
-            ttk.Label(top, textvariable=v, width=6).pack(side="left")
-            ttk.Checkbutton(top, text="EN", variable=en, command=lambda n=name: self._set_dac_enable(block_id, n)).pack(
-                side="right"
-            )
+            # Keep enough room for labels like "VTHR_H" without overlapping the value.
+            ttk.Label(top, text=name, width=8).pack(side="left", padx=(0, 4))
+            tk.Label(top, textvariable=v, font=bold_code_font, width=4, anchor="w").pack(side="left", padx=(0, 10))
+            ttk.Checkbutton(
+                top,
+                text="EN",
+                variable=en,
+                command=lambda n=name: self._set_dac_enable(block_id, n),
+            ).pack(side="right")
 
-            bottom = ttk.Frame(box)
-            bottom.pack(fill="x", pady=(2, 0))
-            entry = ttk.Entry(bottom, width=4)
+            bottom = ttk.Frame(cell)
+            bottom.pack(fill="x", pady=(1, 0))
+            sv = tk.StringVar(value="")
+            self._dac_set_vars[name] = sv
+            entry = ttk.Entry(bottom, width=5, textvariable=sv)
             entry.pack(side="left")
-            ttk.Button(bottom, text="Set", command=lambda n=name, e=entry: self._set_dac_code(block_id, n, e.get())).pack(
-                side="left", padx=(6, 0)
+            ttk.Button(bottom, text="Set", width=5, command=lambda n=name, e=entry: self._set_dac_code(block_id, n, e.get())).pack(
+                side="left", padx=(4, 0)
             )
-            ttk.Label(box, textvariable=mv).pack(anchor="w", pady=(2, 0))
+            # Optional measurement / extra info line (usually empty unless you "Set")
+            if mv is not None:
+                tk.Label(cell, textvariable=mv, font=meas_font, fg="#5a5a5a", anchor="w").pack(anchor="w")
 
         # Mux + connect2pad
         mux = ttk.Labelframe(frm, text="VinjMux / C2P", padding=3)
-        mux.pack(fill="x", pady=(6, 2))
+        mux.pack(fill="x", pady=(4, 2))
 
         r1 = ttk.Frame(mux)
         r1.pack(fill="x", pady=2)
         ttk.Label(r1, text="VinjH:", width=6).pack(side="left")
         ttk.Label(r1, textvariable=self._vinjh_var, width=6).pack(side="left")
-        ttk.Button(r1, text="dac", command=lambda: self._set_vinj(block_id, "VinjH", "dac")).pack(side="left", padx=3)
-        ttk.Button(r1, text="VDDA", command=lambda: self._set_vinj(block_id, "VinjH", "VDDA")).pack(side="left", padx=3)
+        b = tk.Button(r1, text="dac", width=6, command=lambda: self._set_vinj(block_id, "VinjH", "dac"))
+        b.pack(side="left", padx=3)
+        self._vinj_btns["VinjH"]["dac"] = b
+        b = tk.Button(r1, text="VDDA", width=6, command=lambda: self._set_vinj(block_id, "VinjH", "VDDA"))
+        b.pack(side="left", padx=3)
+        self._vinj_btns["VinjH"]["VDDA"] = b
 
         r2 = ttk.Frame(mux)
         r2.pack(fill="x", pady=2)
         ttk.Label(r2, text="VinjL:", width=6).pack(side="left")
         ttk.Label(r2, textvariable=self._vinjl_var, width=6).pack(side="left")
-        ttk.Button(r2, text="dac", command=lambda: self._set_vinj(block_id, "VinjL", "dac")).pack(side="left", padx=3)
-        ttk.Button(r2, text="GNDA", command=lambda: self._set_vinj(block_id, "VinjL", "GNDA")).pack(side="left", padx=3)
+        b = tk.Button(r2, text="dac", width=6, command=lambda: self._set_vinj(block_id, "VinjL", "dac"))
+        b.pack(side="left", padx=3)
+        self._vinj_btns["VinjL"]["dac"] = b
+        b = tk.Button(r2, text="GNDA", width=6, command=lambda: self._set_vinj(block_id, "VinjL", "GNDA"))
+        b.pack(side="left", padx=3)
+        self._vinj_btns["VinjL"]["GNDA"] = b
 
         ttk.Checkbutton(
             mux,
@@ -2645,8 +4702,12 @@ class Ignite64Gui(tk.Tk):
 
         vdda = ttk.Labelframe(frm, text="VDDA", padding=3)
         vdda.pack(fill="x", pady=(6, 0))
-        ttk.Label(vdda, textvariable=self._vdda_var).pack(anchor="w")
-        ttk.Button(vdda, text="Measure", command=lambda: self._measure_vdda(block_id)).pack(anchor="w", pady=(4, 0))
+        vrow = ttk.Frame(vdda)
+        vrow.pack(fill="x", pady=(0, 4))
+        ttk.Label(vrow, text="VDDA =").pack(side="left")
+        tk.Label(vrow, textvariable=self._vdda_var, font=("Segoe UI", 12, "bold")).pack(side="left", padx=(6, 0))
+        ttk.Label(vrow, text="mV").pack(side="left", padx=(4, 0))
+        ttk.Button(vdda, text="Measure VDDA", command=lambda: self._measure_vdda(block_id)).pack(anchor="w", pady=(2, 0))
 
         return frm
 
@@ -2689,6 +4750,10 @@ class Ignite64Gui(tk.Tk):
 
     def _refresh_pixels(self, mat_id: int) -> None:
         quad = self.quad_var.get()
+        # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+        if 4 <= int(mat_id) <= 7:
+            self._set_status(f"MAT {mat_id}: refresh disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            return
 
         def do() -> list[bool]:
             self.hw.select_quadrant(quad)
@@ -2706,6 +4771,10 @@ class Ignite64Gui(tk.Tk):
 
     def _toggle_pixel(self, mat_id: int, pix_id: int) -> None:
         quad = self.quad_var.get()
+        # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+        if 4 <= int(mat_id) <= 7:
+            self._set_status(f"MAT {mat_id}: toggle disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
+            return
 
         def do() -> bool:
             self.hw.select_quadrant(quad)
@@ -2736,7 +4805,7 @@ class Ignite64Gui(tk.Tk):
 
         toolbar = ttk.Frame(frm)
         toolbar.pack(fill="x", pady=(0, 10))
-        ttk.Button(toolbar, text="Refresh", command=lambda: self._refresh_analog(block_id)).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Read", command=lambda: self._refresh_analog(block_id)).pack(side="left", padx=6)
 
         body = ttk.Frame(frm)
         body.pack(fill="both", expand=True)
@@ -2750,6 +4819,7 @@ class Ignite64Gui(tk.Tk):
         self._dac_vars: dict[str, tk.StringVar] = {}
         self._dac_en_vars: dict[str, tk.BooleanVar] = {}
         self._dac_meas_vars: dict[str, tk.StringVar] = {}
+        self._dac_set_vars: dict[str, tk.StringVar] = {}
 
         dacs = ["VTHR_H", "VTHR_L", "VINJ_H", "VINJ_L", "VLDO", "VFB"]
         for i, name in enumerate(dacs):
@@ -2764,7 +4834,9 @@ class Ignite64Gui(tk.Tk):
             ttk.Checkbutton(row, text="EN", variable=en, command=lambda n=name: self._set_dac_enable(block_id, n)).pack(
                 side="left", padx=(6, 0)
             )
-            entry = ttk.Entry(row, width=6)
+            sv = tk.StringVar(value="")
+            self._dac_set_vars[name] = sv
+            entry = ttk.Entry(row, width=6, textvariable=sv)
             entry.pack(side="left", padx=(10, 6))
             ttk.Button(
                 row,
@@ -2779,24 +4851,30 @@ class Ignite64Gui(tk.Tk):
         self._vinjh_var = tk.StringVar(value="?")
         self._vinjl_var = tk.StringVar(value="?")
         self._c2p_var = tk.BooleanVar(value=False)
+        # Keep references to mux buttons to highlight selected state.
+        self._vinj_btns: dict[str, dict[str, tk.Button]] = {"VinjH": {}, "VinjL": {}}
 
         mux_row = ttk.Frame(right)
         mux_row.pack(fill="x", pady=6)
         ttk.Label(mux_row, text="VinjH mux:", width=10).pack(side="left")
         ttk.Label(mux_row, textvariable=self._vinjh_var, width=10).pack(side="left", padx=(6, 10))
-        ttk.Button(mux_row, text="dac", command=lambda: self._set_vinj(block_id, "VinjH", "dac")).pack(side="left")
-        ttk.Button(mux_row, text="VDDA", command=lambda: self._set_vinj(block_id, "VinjH", "VDDA")).pack(
-            side="left", padx=(6, 0)
-        )
+        b = tk.Button(mux_row, text="dac", width=6, command=lambda: self._set_vinj(block_id, "VinjH", "dac"))
+        b.pack(side="left")
+        self._vinj_btns["VinjH"]["dac"] = b
+        b = tk.Button(mux_row, text="VDDA", width=6, command=lambda: self._set_vinj(block_id, "VinjH", "VDDA"))
+        b.pack(side="left", padx=(6, 0))
+        self._vinj_btns["VinjH"]["VDDA"] = b
 
         mux_row2 = ttk.Frame(right)
         mux_row2.pack(fill="x", pady=6)
         ttk.Label(mux_row2, text="VinjL mux:", width=10).pack(side="left")
         ttk.Label(mux_row2, textvariable=self._vinjl_var, width=10).pack(side="left", padx=(6, 10))
-        ttk.Button(mux_row2, text="dac", command=lambda: self._set_vinj(block_id, "VinjL", "dac")).pack(side="left")
-        ttk.Button(mux_row2, text="GNDA", command=lambda: self._set_vinj(block_id, "VinjL", "GNDA")).pack(
-            side="left", padx=(6, 0)
-        )
+        b = tk.Button(mux_row2, text="dac", width=6, command=lambda: self._set_vinj(block_id, "VinjL", "dac"))
+        b.pack(side="left")
+        self._vinj_btns["VinjL"]["dac"] = b
+        b = tk.Button(mux_row2, text="GNDA", width=6, command=lambda: self._set_vinj(block_id, "VinjL", "GNDA"))
+        b.pack(side="left", padx=(6, 0))
+        self._vinj_btns["VinjL"]["GNDA"] = b
 
         c2p_row = ttk.Frame(right)
         c2p_row.pack(fill="x", pady=10)
@@ -2808,7 +4886,17 @@ class Ignite64Gui(tk.Tk):
         ).pack(side="left")
 
         ttk.Separator(right).pack(fill="x", pady=10)
-        ttk.Button(right, text="Measure VDDA", command=lambda: self._measure_vdda(block_id)).pack(anchor="w")
+        # VDDA measurement (shows result in mV below)
+        if not hasattr(self, "_vdda_var"):
+            self._vdda_var = tk.StringVar(value="?")  # type: ignore[attr-defined]
+        vdda_box = ttk.Labelframe(right, text="VDDA", padding=8)
+        vdda_box.pack(fill="x", pady=(0, 6))
+        vrow = ttk.Frame(vdda_box)
+        vrow.pack(fill="x", pady=(0, 4))
+        ttk.Label(vrow, text="VDDA =").pack(side="left")
+        tk.Label(vrow, textvariable=self._vdda_var, font=("Segoe UI", 12, "bold")).pack(side="left", padx=(6, 0))
+        ttk.Label(vrow, text="mV").pack(side="left", padx=(4, 0))
+        ttk.Button(vdda_box, text="Measure VDDA", command=lambda: self._measure_vdda(block_id)).pack(anchor="w")
 
         self._refresh_analog(block_id)
         return frm
@@ -2836,7 +4924,7 @@ class Ignite64Gui(tk.Tk):
         if r is None:
             return
         for name, val in r.items():
-            if name in {"vinj", "c2p", "bias"}:
+            if name in {"vinj", "c2p", "bias"} or str(name).startswith("meas_"):
                 continue
             d = val  # type: ignore[assignment]
             try:
@@ -2844,6 +4932,13 @@ class Ignite64Gui(tk.Tk):
                 code = int(d["code"])  # type: ignore[index]
                 self._dac_vars[name].set(f"{code}")
                 self._dac_en_vars[name].set(enable)
+                # Prefill the Set-entry with current code for quick repeated Set clicks.
+                try:
+                    sv = getattr(self, "_dac_set_vars", {}).get(str(name))
+                    if isinstance(sv, tk.StringVar):
+                        sv.set(str(int(code)))
+                except Exception:
+                    pass
             except Exception:
                 self._dac_vars[name].set("?")
                 self._dac_en_vars[name].set(False)
@@ -2854,11 +4949,25 @@ class Ignite64Gui(tk.Tk):
 
         vinj = r.get("vinj", {})  # type: ignore[assignment]
         try:
-            self._vinjh_var.set(str(vinj["VinjH"]))  # type: ignore[index]
-            self._vinjl_var.set(str(vinj["VinjL"]))  # type: ignore[index]
+            vinjh = str(vinj["VinjH"])  # type: ignore[index]
+            vinjl = str(vinj["VinjL"])  # type: ignore[index]
+            self._vinjh_var.set(vinjh)
+            self._vinjl_var.set(vinjl)
         except Exception:
+            vinjh = "?"
+            vinjl = "?"
             self._vinjh_var.set("?")
             self._vinjl_var.set("?")
+        # Highlight selected mux buttons (best-effort).
+        try:
+            on_bg = "#1f9d55"
+            off_bg = "#e0e0e0"
+            for k, b in getattr(self, "_vinj_btns", {}).get("VinjH", {}).items():
+                b.configure(bg=(on_bg if str(k) == str(vinjh) else off_bg))
+            for k, b in getattr(self, "_vinj_btns", {}).get("VinjL", {}).items():
+                b.configure(bg=(on_bg if str(k) == str(vinjl) else off_bg))
+        except Exception:
+            pass
         self._c2p_var.set(bool(r.get("c2p", False)))
 
         bias = r.get("bias")
@@ -2908,10 +5017,35 @@ class Ignite64Gui(tk.Tk):
             rb = self.hw.readAnalogColumnDAC(quad, block=owner, dac=dac)
             ch = self._adc_channel_for_dac(dac)
             meas_v = None
+            meas_mv = None
             if ch is not None:
-                r = self.hw._adc_quad_oneshot(channel=ch, gain=0, res_bits=16, delay_s=0.01)  # type: ignore[attr-defined]
-                meas_v = float(r["value"])
-            return {"readback": rb, "meas_v": meas_v}
+                # Ensure connect-to-pad is enabled ONLY for this block before ADC sampling,
+                # matching the C# workflow (otherwise ADC may be reading a different MAT).
+                try:
+                    en_vth = dac.strip().upper() in {"VTHR_H", "VTHR_L", "VINJ_H"}
+                    en_vldo = dac.strip().upper() == "VLDO"
+                    en_vfb = dac.strip().upper() in {"VFB", "VF"}
+                    self.hw._set_connect2pad_and_probes_only(  # type: ignore[attr-defined]
+                        quad,
+                        block=owner,
+                        en_p_vth=en_vth,
+                        en_p_vldo=en_vldo,
+                        en_p_vfb=en_vfb,
+                    )
+                except Exception:
+                    pass
+                # Give analog mux/probe some settle time before sampling.
+                time.sleep(0.02)
+                r = self.hw._adc_quad_oneshot(channel=ch, gain=0, res_bits=16, delay_s=0.03)  # type: ignore[attr-defined]
+                try:
+                    meas_v = float(r["value"])
+                except Exception:
+                    meas_v = None
+                try:
+                    meas_mv = float(r.get("value_mv"))  # type: ignore[arg-type]
+                except Exception:
+                    meas_mv = None
+            return {"readback": rb, "meas_v": meas_v, "meas_mv": meas_mv}
 
         r = self._with_hw(do, busy=f"Set {dac}={code} + verify (Q={quad} ownerMAT={owner})")
         if isinstance(r, dict):
@@ -2919,12 +5053,23 @@ class Ignite64Gui(tk.Tk):
                 rb = r.get("readback", {})
                 rb_code = int(rb.get("code"))  # type: ignore[arg-type]
                 meas_v = r.get("meas_v", None)
+                meas_mv = r.get("meas_mv", None)
                 if meas_v is None:
                     self._set_status(f"{dac}: set={code} readback={rb_code} (no ADC mapping)")
                 else:
-                    self._set_status(f"{dac}: set={code} readback={rb_code} meas={float(meas_v):.6g} V")
+                    if meas_mv is None:
+                        self._set_status(f"{dac}: set={code} readback={rb_code} meas={float(meas_v):.6g} V")
+                    else:
+                        self._set_status(
+                            f"{dac}: set={code} readback={rb_code} meas={float(meas_v):.6g} V ({float(meas_mv):.6g} mV)"
+                        )
                     try:
-                        self._dac_meas_vars[dac.strip().upper()].set(f"{float(meas_v):.4g} V")  # type: ignore[index]
+                        if meas_mv is None:
+                            self._dac_meas_vars[dac.strip().upper()].set(f"{float(meas_v):.4g} V")  # type: ignore[index]
+                        else:
+                            self._dac_meas_vars[dac.strip().upper()].set(
+                                f"{float(meas_v):.4g} V / {float(meas_mv):.4g} mV"
+                            )  # type: ignore[index]
                     except Exception:
                         pass
             except Exception:
@@ -2976,34 +5121,105 @@ class Ignite64Gui(tk.Tk):
         v = self._with_hw(do, busy=f"Measuring VDDA (Q={quad} ownerMAT={owner})")
         if v is None:
             return
+        v_mv = float(v) * 1000.0
         try:
-            self._vdda_var.set(f"{float(v):.6g} V")  # type: ignore[attr-defined]
+            self._vdda_var.set(f"{float(v_mv):.6g}")  # type: ignore[attr-defined]
         except Exception:
             pass
-        self._set_status(f"VDDA={float(v):.6g} (Q={quad} block={block_id})")
+        self._set_status(f"VDDA={float(v_mv):.6g} mV (Q={quad} block={block_id})")
 
 
 def run_gui(
     *,
-    start_config: bool = True,
+    start_config: object = True,
     default_quad: str = "SW",
     base_config_file: Optional[str] = None,
     si5340_config_file: Optional[str] = None,
 ) -> None:
     offline = _env_truthy("OFFLINE", "0")
     hw = Ignite64()
-    if (not offline) and start_config:
-        kwargs: dict[str, object] = {}
-        if base_config_file:
-            kwargs["full_cfg"] = base_config_file
-        if si5340_config_file:
-            kwargs["si5340_cfg"] = si5340_config_file
-        hw.start_config(default_quad, **kwargs)  # type: ignore[arg-type]
+    q0 = str(default_quad).strip().upper()
+
+    def _resolve_full_cfg_path() -> Optional[Path]:
+        try:
+            cfg_base = Path(__file__).resolve().parents[1] / "ConfigurationFiles"
+            default_full_cfg_name = "IGNITE64_configSW_26.04.29.12.31.45.txt"
+            if base_config_file:
+                p = Path(str(base_config_file))
+                return p if (p.is_absolute() or len(p.parts) > 1) else (cfg_base / p)
+            candidates = sorted(
+                cfg_base.glob("IGNITE64_configSW_*.txt"),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
+            )
+            return candidates[0] if candidates else (cfg_base / default_full_cfg_name)
+        except Exception:
+            return None
+
+    def _hw_reachable() -> bool:
+        """
+        Best-effort: if we can read a few registers, treat chip as "reachable" and in AUTO mode
+        we will not rewrite configuration (preserve current chip state).
+        """
+        try:
+            hw.select_quadrant(q0)
+            try:
+                hw.TopReadout("i2c")
+            except Exception:
+                pass
+            # Minimal reachability check: TOP + MAT0 few bytes.
+            _ = list(hw.i2c_read_bytes(hw.addr.top_addr, 0, 2))
+            dev0 = hw.matid_to_devaddr(0)
+            _ = int(hw.i2c_read_byte(dev0, 0)) & 0xFF
+            _ = int(hw.i2c_read_byte(dev0, 64)) & 0xFF
+            return True
+        except Exception:
+            return False
+
+    sc_mode = str(start_config).strip().lower() if isinstance(start_config, str) else ""
+    do_start_config = bool(start_config) if not isinstance(start_config, str) else (sc_mode not in {"0", "false", "no", "off", ""})
+    auto_mode = isinstance(start_config, str) and sc_mode == "auto"
+    _dbg(
+        f"START_CONFIG decision: arg={start_config!r} offline={int(offline)} do_start_config={int(do_start_config)} auto_mode={int(auto_mode)}"
+    )
+
+    did_write_config = False
+    if (not offline) and do_start_config:
+        reachable = False
+        if auto_mode:
+            # AUTO mode: init HW transport first, then decide.
+            try:
+                hw.init_hw(
+                    q0,
+                    full_cfg=base_config_file,
+                    si5340_cfg=str(si5340_config_file or "Si5340-RevD_Crystal-Registers_bis.txt"),
+                )
+            except Exception as e:
+                _dbg(f"AUTO init_hw failed: {e!r}")
+            reachable = _hw_reachable()
+            _dbg(f"AUTO reachability: {int(reachable)} (default_quad={q0})")
+            if reachable:
+                _dbg(f"start config skipped (AUTO: preserve current chip state) (default_quad={q0})")
+            else:
+                _dbg(f"start config will run (AUTO: chip not reachable) (default_quad={q0})")
+        if auto_mode and reachable:
+            pass
+        else:
+            kwargs: dict[str, object] = {}
+            if base_config_file:
+                kwargs["full_cfg"] = base_config_file
+            if si5340_config_file:
+                kwargs["si5340_cfg"] = si5340_config_file
+            _dbg(f"start config loaded (default_quad={default_quad})")
+            hw.start_config(default_quad, **kwargs)  # type: ignore[arg-type]
+            did_write_config = True
     app = Ignite64Gui(hw, default_quad=default_quad, offline=offline)
-    # Dopo la configurazione di base, leggiamo subito MAT/pixel+FTDAC per rendere la UI coerente
-    # al primo ingresso nelle view di block.
-    if (not offline) and start_config:
-        app._capture_mat_snapshot(default_quad)
-        app._mat_snapshot_prefill_active = True
+
+    # Start snapshot prefill AFTER GUI is responsive (avoid blank/unresponsive window on Windows).
+    if not offline:
+        if did_write_config:
+            app.after(50, lambda: app._start_initial_snapshot_prefill(default_quad, base_config_file))
+        else:
+            app.after(50, lambda: app._start_initial_snapshot_refresh_from_hw(default_quad))
     app.mainloop()
 

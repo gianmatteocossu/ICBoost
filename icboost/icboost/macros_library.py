@@ -110,6 +110,8 @@ def builtin_pixels_all_off_quad(hw, quad: str) -> dict[str, Any]:
     q = _q(quad)
     hw.select_quadrant(q)
     for mat in range(16):
+        if 4 <= int(mat) <= 7:
+            continue
         for ch in range(64):
             hw.AnalogChannelOFF(q, mattonella=mat, canale=ch)
     return {"quad": q, "action": "all_pixels_off"}
@@ -122,6 +124,8 @@ def builtin_pixel_on(hw, quad: str, *, mat: int, channel: int) -> dict[str, Any]
     ch = int(channel)
     if mat < 0 or mat > 15 or ch < 0 or ch > 63:
         raise ValueError("mat 0..15, channel 0..63")
+    if 4 <= mat <= 7:
+        raise Ignite64TransportError("MAT 4..7: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
     hw.AnalogChannelON(q, mattonella=mat, canale=ch)
     return {"quad": q, "mat": mat, "channel": ch, "on": True}
 
@@ -132,6 +136,8 @@ def builtin_pixel_off(hw, quad: str, *, mat: int, channel: int) -> dict[str, Any
     ch = int(channel)
     if mat < 0 or mat > 15 or ch < 0 or ch > 63:
         raise ValueError("mat 0..15, channel 0..63")
+    if 4 <= mat <= 7:
+        raise Ignite64TransportError("MAT 4..7: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
     hw.AnalogChannelOFF(q, mattonella=mat, canale=ch)
     return {"quad": q, "mat": mat, "channel": ch, "on": False}
 
@@ -142,6 +148,8 @@ def builtin_mat_all_pixels_on(hw, quad: str, *, mat: int) -> dict[str, Any]:
     mat = int(mat)
     if mat < 0 or mat > 15:
         raise ValueError("mat atteso 0..15")
+    if 4 <= mat <= 7:
+        raise Ignite64TransportError("MAT 4..7: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
     hw.select_quadrant(q)
     for ch in range(64):
         hw.AnalogChannelON(q, mattonella=mat, canale=ch)
@@ -154,6 +162,8 @@ def builtin_mat_all_pixels_off(hw, quad: str, *, mat: int) -> dict[str, Any]:
     mat = int(mat)
     if mat < 0 or mat > 15:
         raise ValueError("mat atteso 0..15")
+    if 4 <= mat <= 7:
+        raise Ignite64TransportError("MAT 4..7: accesso diretto disabilitato (I2C stack issue). Usa broadcast/CalibDCO.")
     hw.select_quadrant(q)
     for ch in range(64):
         hw.AnalogChannelOFF(q, mattonella=mat, canale=ch)
@@ -165,6 +175,8 @@ def builtin_quad_all_pixels_on(hw, quad: str) -> dict[str, Any]:
     q = _q(quad)
     hw.select_quadrant(q)
     for mat in range(16):
+        if 4 <= int(mat) <= 7:
+            continue
         for ch in range(64):
             hw.AnalogChannelON(q, mattonella=mat, canale=ch)
     return {"quad": q, "action": "all_pixels_on", "total": 16 * 64}
