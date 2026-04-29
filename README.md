@@ -33,4 +33,4 @@ Per contribuire o pubblicare su Git, vedi **[CONTRIBUTING.md](CONTRIBUTING.md)**
 
 ## DLL
 
-Le DLL del vendor non sono incluse nel repository (vedi `.gitignore`). Copiale nella cartella del progetto (`icboost/`) o nel `PATH` come descritto nella guida d’installazione.
+Il bridge hardware **`TCPtoI2C.dll`** e **`USBtoI2C32.dll`** sono nella cartella **`icboost/`** nel clone; per percorsi alternativi (PATH, `dll_dir=`) vedi **[icboost/docs/INSTALLAZIONE_WINDOWS.md](icboost/docs/INSTALLAZIONE_WINDOWS.md)**.

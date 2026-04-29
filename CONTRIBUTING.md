@@ -32,14 +32,14 @@ Seguire **[icboost/docs/INSTALLAZIONE_WINDOWS.md](icboost/docs/INSTALLAZIONE_WIN
 
 ### DLL
 
-Posizionare `TCPtoI2C.dll` e `USBtoI2C32.dll` come da documentazione (cartella progetto `icboost/` o `PATH`). Non vengono committate di default (`.gitignore` include `*.dll`). In un fork **privato**, se la licenza lo consente, si può rimuovere o commentare quella riga in `.gitignore`.
+Il repository include `TCPtoI2C.dll` e `USBtoI2C32.dll` in **`icboost/`** (accanto a `pyproject.toml`) così il clone ha già il bridge necessario al wrapper Python. In alternativa si possono usare copie nel **PATH** come in `INSTALLAZIONE_WINDOWS.md`.
 
 ## Cosa versionare
 
 | Versionare | Evitare (già in .gitignore) |
 |------------|------------------------------|
-| Sorgenti `.py`, `.cs`, `pyproject.toml`, `docs/`, `.cursor/rules/`, `AGENTS.md` | `__pycache__`, `.venv`, `*.egg-info`, `obj/`, `bin/` |
-| `ConfigurationFiles/` testo, asset immagini in `<cartella-progetto>/icboost/assets/` | DLL vendor (salvo policy diversa) |
+| Sorgenti `.py`, `.cs`, `pyproject.toml`, `docs/`, `.cursor/rules/`, `AGENTS.md`, `icboost/*.dll` bridge | `__pycache__`, `.venv`, `*.egg-info`, `obj/`, `bin/` |
+| `ConfigurationFiles/` testo, asset immagini in `<cartella-progetto>/icboost/assets/` | Altri binari non necessari al progetto |
 
 ## Primo commit (esempio)
 

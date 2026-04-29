@@ -123,6 +123,8 @@ Il software usa le stesse DLL del tool C#:
 | **TCPtoI2C.dll** | Stack principale (modalità affini al tool legacy). |
 | **USBtoI2C32.dll** | USB / caricamento come backend I2C. |
 
+Nel **clone del repository** questi due file sono già nella cartella **`icboost/`** (stesso livello di `pyproject.toml`). Se in un working copy mancano, copiali dall’installazione del tool C# o da un clone aggiornato.
+
 **Come renderle disponibili**
 
 1. **Cartella nota + PATH**  

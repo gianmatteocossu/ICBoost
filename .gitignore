@@ -42,8 +42,7 @@ Desktop.ini
 *.ilk
 *.pdb
 
-# --- DLL bridge hardware (copiare da installazione tool C#; spesso non ridistribuibili) ---
-*.dll
+# --- DLL bridge I2C (TCP/USB): versionate in icboost/ per clone installabile senza copie manuali ---
 
 # --- Cursor (cache locale; le regole in .cursor/rules/ restano versionate) ---
 # (nessun ignore globale per .cursor/ — si versionano rules + contesto)

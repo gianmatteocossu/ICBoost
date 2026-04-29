@@ -6,6 +6,6 @@ alwaysApply: true
 # Repository tb_ignite64_source
 
 - Radice: progetto **C#** `tb_Ignite64` (.NET Framework) come riferimento GUI legacy; cartella **`icboost/`** = pacchetto Python ICBoost (`import icboost`) + Tk GUI + docs (in checkout vecchi può chiamarsi ancora `ignite64py/`).
-- DLL **non** versionate di default (`.gitignore`: `*.dll`); istruzioni in `icboost/docs/INSTALLAZIONE_WINDOWS.md` (percorso reale finché non rinomini: `ignite64py/docs/...`).
+- DLL bridge **`TCPtoI2C.dll`** / **`USBtoI2C32.dll`** in **`icboost/`**; istruzioni aggiuntive in `icboost/docs/INSTALLAZIONE_WINDOWS.md`.
 - Per contesto esteso leggere **`AGENTS.md`** nella radice e **`CONTRIBUTING.md`** per clone/commit.
 - Documentazione operativa API/macro: **`icboost/docs/GUIDA_HW_E_MACRO.md`** (o `ignite64py/docs/...` finché la cartella non è rinominata).

@@ -29,9 +29,10 @@ Oggi `<cartella-progetto>` può essere ancora `ignite64py/`; dopo la rinomina in
 - Modifiche GUI: preferire patch piccole; non rimuovere commenti utili al mapping C#.
 - Macro: parametri in cima al file in `examples/macros/`; logica condivisa in `macros_library`.
 
-## Cosa non è in repo
+## Binari e cosa resta fuori
 
-- **DLL** vendor (spesso ignorate da `.gitignore`): vanno copiate come da `INSTALLAZIONE_WINDOWS.md`.
+- **DLL bridge** del wrapper: **`icboost/TCPtoI2C.dll`** e **`icboost/USBtoI2C32.dll`** sono nel repository per un clone installabile senza copie manuali (dettagli in `INSTALLAZIONE_WINDOWS.md`).
+- **Non** versionati: cartelle di build C# (`bin/`, `obj/`), ambienti virtuali Python, altri binari non richiesti dal pacchetto `icboost`.
 
 ## Chat storiche
 
