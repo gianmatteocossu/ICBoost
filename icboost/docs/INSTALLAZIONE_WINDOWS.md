@@ -230,6 +230,7 @@ Cosa succede (semplificato):
 | Script / comando | Scopo |
 |------------------|--------|
 | `python examples\list_devices.py` | Elenco serial USB / verifica DLL (richiede DLL e percorso come negli esempi). |
+| `python examples\recover_bus_and_usb.py` | Recovery/diagnostica dopo errori bridge USB (es. `WDU_Transfer`): re-init con bus recovery + prova `select_quadrant` + letture minime TOP/IOext. |
 | `python examples\hw_smoke_check.py` | Checklist rapida I2C dopo lunga inattività. |
 | `python examples\basic_sequence.py` | Console interattiva con oggetto `hw` (vedi messaggi nel file). |
 | Macro | `examples\macros\*.py` + documentazione in `examples\macros\README.md`. |
