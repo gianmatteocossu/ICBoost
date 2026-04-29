@@ -60,5 +60,12 @@ from icboost.gui_tk import run_gui
 if __name__ == "__main__":
     # START_CONFIG=0 skips hw.start_config even when OFFLINE=0 (optional).
     start_config = os.environ.get("START_CONFIG", "1").strip() not in {"0", "false", "no", "off", ""}
-    run_gui(start_config=start_config, default_quad=os.environ.get("QUAD", "SW"))
+    base_cfg = os.environ.get("BASE_CONFIG_FILE", "").strip() or None
+    si_cfg = os.environ.get("SI5340_CONFIG_FILE", "").strip() or None
+    run_gui(
+        start_config=start_config,
+        default_quad=os.environ.get("QUAD", "SW"),
+        base_config_file=base_cfg,
+        si5340_config_file=si_cfg,
+    )
 

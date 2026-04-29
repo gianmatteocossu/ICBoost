@@ -430,6 +430,10 @@ class Ignite64Gui(tk.Tk):
         self._quadrants_top_mon_job: Optional[str] = None
         self._quadrants_top_mon_seq: int = 0
         self._macro_script_paths: list[Path] = []
+        # Cache "snapshot" per aggiornare subito la view Block (pix ON + codice FTDAC)
+        # dopo la configurazione di base all'apertura GUI.
+        self._mat_snapshot_cache: dict[str, dict[int, dict[str, object]]] = {q: {} for q in ("NW", "NE", "SW", "SE")}
+        self._mat_snapshot_prefill_active: bool = False
 
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
@@ -916,6 +920,36 @@ class Ignite64Gui(tk.Tk):
             return None
         finally:
             self.update_idletasks()
+
+    def _capture_mat_snapshot(self, quad: str) -> None:
+        """
+        Lettura pre-caricata MAT (pix_on + ftdac) per una singola quadrant.
+        Serve solo per mostrare subito lo stato corretto in UI dopo `hw.start_config`.
+        """
+        if self.offline:
+            return
+        q = str(quad).strip().upper()
+        if q not in self._mat_snapshot_cache:
+            return
+        # Reset cache per evitare dati vecchi.
+        self._mat_snapshot_cache[q] = {}
+        for mat_id in range(16):
+            try:
+                r = self.hw.readMatPixelsAndFTDAC(q, mattonella=mat_id)
+                if not isinstance(r, dict):
+                    continue
+                pix_on = r.get("pix_on")
+                ftdac = r.get("ftdac")
+                if (
+                    isinstance(pix_on, list)
+                    and isinstance(ftdac, list)
+                    and len(pix_on) == 64
+                    and len(ftdac) == 64
+                ):
+                    self._mat_snapshot_cache[q][mat_id] = {"pix_on": pix_on, "ftdac": ftdac}
+            except Exception:
+                # Best-effort: se una singola MAT fallisce, la UI la rileggerà al bisogno.
+                continue
 
     def _fifo_decode_word(self, w: int) -> dict[str, int]:
         """
@@ -2375,15 +2409,30 @@ class Ignite64Gui(tk.Tk):
     def _refresh_mat_mini(self, mat_id: int) -> None:
         quad = self.quad_var.get()
 
-        def do() -> dict[str, object]:
-            return self.hw.readMatPixelsAndFTDAC(quad, mattonella=mat_id)
+        # Se abbiamo fatto uno snapshot di avvio, usalo per rendere immediata la view.
+        cached: Optional[dict[str, object]] = None
+        if self._mat_snapshot_prefill_active:
+            cached = self._mat_snapshot_cache.get(str(quad).strip().upper(), {}).get(int(mat_id))
 
-        r = self._with_hw(do, busy=f"Refreshing MAT {mat_id} (Q={quad})")
-        if r is None or not isinstance(r, dict):
-            return
-        pix_on = r.get("pix_on")
-        ftdac = r.get("ftdac")
-        if not isinstance(pix_on, list) or not isinstance(ftdac, list) or len(pix_on) != 64 or len(ftdac) != 64:
+        if isinstance(cached, dict):
+            pix_on = cached.get("pix_on")
+            ftdac = cached.get("ftdac")
+        else:
+            def do() -> dict[str, object]:
+                return self.hw.readMatPixelsAndFTDAC(quad, mattonella=mat_id)
+
+            r = self._with_hw(do, busy=f"Refreshing MAT {mat_id} (Q={quad})")
+            if r is None or not isinstance(r, dict):
+                return
+            pix_on = r.get("pix_on")
+            ftdac = r.get("ftdac")
+
+        if not (
+            isinstance(pix_on, list)
+            and isinstance(ftdac, list)
+            and len(pix_on) == 64
+            and len(ftdac) == 64
+        ):
             return
         canvas = self._block_pix_canvas.get(mat_id)
         rects = self._block_pix_cells.get(mat_id)
@@ -2415,6 +2464,9 @@ class Ignite64Gui(tk.Tk):
             self._refresh_analog(block_id)
         except Exception:
             pass
+        # Dopo la prima apertura/sincronizzazione di una block view, non riusare più la cache
+        # (per evitare discrepanze se l'hardware cambia).
+        self._mat_snapshot_prefill_active = False
         self._set_status(f"Block {block_id} refreshed (Q={quad})")
 
     def _build_analog_mini(self, parent: ttk.Frame, block_id: int, *, kind: str) -> ttk.Frame:
@@ -2870,11 +2922,27 @@ class Ignite64Gui(tk.Tk):
         self._set_status(f"VDDA={float(v):.6g} (Q={quad} block={block_id})")
 
 
-def run_gui(*, start_config: bool = True, default_quad: str = "SW") -> None:
+def run_gui(
+    *,
+    start_config: bool = True,
+    default_quad: str = "SW",
+    base_config_file: Optional[str] = None,
+    si5340_config_file: Optional[str] = None,
+) -> None:
     offline = _env_truthy("OFFLINE", "0")
     hw = Ignite64()
     if (not offline) and start_config:
-        hw.start_config(default_quad)
+        kwargs: dict[str, object] = {}
+        if base_config_file:
+            kwargs["full_cfg"] = base_config_file
+        if si5340_config_file:
+            kwargs["si5340_cfg"] = si5340_config_file
+        hw.start_config(default_quad, **kwargs)  # type: ignore[arg-type]
     app = Ignite64Gui(hw, default_quad=default_quad, offline=offline)
+    # Dopo la configurazione di base, leggiamo subito MAT/pixel+FTDAC per rendere la UI coerente
+    # al primo ingresso nelle view di block.
+    if (not offline) and start_config:
+        app._capture_mat_snapshot(default_quad)
+        app._mat_snapshot_prefill_active = True
     app.mainloop()
 
