@@ -150,6 +150,22 @@ python -m pip install -e .
 
 Così da qualsiasi directory puoi eseguire script che fanno `import icboost`, purché il venv sia attivo (o l’installazione sia nel Python di sistema).
 
+### Se `pip install -e .` fallisce per `setuptools`/`wheel` (assenza rete / DNS)
+
+In alcuni ambienti (offline, proxy, DNS bloccati) `pip` può provare a scaricare le **build dependencies** dichiarate in `pyproject.toml` (tipicamente `setuptools` e `wheel`) e fallire con errori tipo *`getaddrinfo failed`* o *`No matching distribution found for setuptools`*.
+
+Per evitare l’installazione in build-isolation (usa i pacchetti già presenti nel tuo ambiente):
+
+```text
+python -m pip install -e . --no-build-isolation
+```
+
+Se serve ancora più compatibilità (disabilita PEP517):
+
+```text
+python -m pip install -e . --no-use-pep517
+```
+
 Senza installazione, è possibile aggiungere manualmente il percorso del progetto a `PYTHONPATH` o usare gli script in `examples/` che inseriscono il repo in `sys.path` (come `gui_monitor.py`).
 
 ---
