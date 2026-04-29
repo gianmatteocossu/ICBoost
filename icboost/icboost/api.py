@@ -1108,6 +1108,12 @@ class Ignite64(Ignite64LowLevel):
         m = int(mattonella)
         if m < 0 or m > 15:
             raise ValueError("mattonella out of range (expected 0..15)")
+        # Some configuration snapshots may leave TOP readout interface not in I2C.
+        # The GUI expects I2C-accessible MAT registers to be read back correctly.
+        try:
+            self.TopReadout("i2c")
+        except Exception:
+            pass
         dev = self.matid_to_devaddr(m)
 
         # Pixel regs 0..63: bit6 is PIXON
