@@ -434,6 +434,7 @@ class Ignite64Gui(tk.Tk):
         # dopo la configurazione di base all'apertura GUI.
         self._mat_snapshot_cache: dict[str, dict[int, dict[str, object]]] = {q: {} for q in ("NW", "NE", "SW", "SE")}
         self._mat_snapshot_prefill_active: bool = False
+        self._analog_power_btn: Optional[tk.Button] = None
 
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
@@ -1118,6 +1119,29 @@ class Ignite64Gui(tk.Tk):
                 q, st, power_ok=power_ok, power_err=power_err
             )
         self._trigger_die_canvas_refresh()
+        # Update analog power button in Quadrants view (if present).
+        if self._analog_power_btn is not None:
+            self._update_analog_power_button(power_ok=power_ok, power_err=power_err)
+
+    def _update_analog_power_button(self, *, power_ok: Optional[bool], power_err: Optional[str]) -> None:
+        if self._analog_power_btn is None:
+            return
+        if power_err:
+            self._analog_power_btn.configure(
+                bg="#757575",
+                activebackground="#757575",
+                fg="white",
+                text="Analog Power: ERR",
+            )
+            return
+        if power_ok is None:
+            return
+        self._analog_power_btn.configure(
+            bg="#1f9d55" if power_ok else "#aa2222",
+            activebackground="#1f9d55" if power_ok else "#aa2222",
+            fg="white",
+            text=f"Analog Power: {'ON' if power_ok else 'OFF'} (click to {'OFF' if power_ok else 'ON'})",
+        )
 
     def _apply_monitor_panels_error(self, msg: str) -> None:
         short = str(msg).replace("\n", " ")[:120]
@@ -1597,6 +1621,43 @@ class Ignite64Gui(tk.Tk):
             wraplength=1050,
             justify="left",
         ).pack(anchor="w")
+
+        # Analog power toggle: green when ON, red when OFF.
+        # This uses the global IOext GPIO reg10 bit6 (inverted logic, same as C#).
+        def _analog_power_toggle() -> None:
+            if self.offline:
+                self._set_status("Analog Power toggle (offline)")
+                return
+
+            def do() -> bool:
+                cur = bool(self.hw.readAnalogPower())
+                target = not cur
+                self.hw.setAnalogPower(target)
+                return target
+
+            new_state = self._with_hw(do, busy=f"Analog Power toggle (Q={self.quad_var.get()})")
+            if new_state is None or not isinstance(new_state, bool):
+                return
+
+            # Optimistic UI update; monitor will re-sync next tick anyway.
+            self._update_analog_power_button(power_ok=new_state, power_err=None)
+
+        # Prefer a classic tk.Button (tk/tile colors are more consistent than ttk style backgrounds).
+        self._analog_power_btn = tk.Button(
+            frm,
+            text="Analog Power: —",
+            bg="#757575" if self.offline else "#757575",
+            fg="white",
+            activebackground="#757575",
+            activeforeground="white",
+            command=_analog_power_toggle,
+            relief="raised",
+            width=26,
+        )
+        if self.offline:
+            self._analog_power_btn.configure(state="disabled")
+        self._analog_power_btn.pack(anchor="w", pady=(0, 10))
+
         ttk.Label(
             top_mon,
             text="Per modificare driver / readout / SLVS / TP apri la pagina TOP cliccando la fascia TOP (blu) sul die.",

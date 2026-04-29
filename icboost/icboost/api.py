@@ -949,6 +949,29 @@ class Ignite64(Ignite64LowLevel):
         b = self.i2c_read_byte(self.addr.ioext_addr, 10)
         return ((b >> 6) & 1) != 1
 
+    def setAnalogPower(self, on: bool) -> None:
+        """
+        Imposta lo stato Analog Power (IOext reg 10, bit6 invertito).
+
+        C#:
+          - AnaPwr_chkBox.Checked = ((num >> 6) & 1) != 1
+          - quindi Analog Power ON quando bit6 == 0
+        """
+        try:
+            self.autodetect_ioext_address()
+        except Exception:
+            # Best-effort: if autodetect fails, we still try current addr.ioext_addr.
+            pass
+        dev = int(self.addr.ioext_addr)
+        b = int(self.i2c_read_byte(dev, 10)) & 0xFF
+        if on:
+            # clear bit6
+            new = b & ~(1 << 6)
+        else:
+            # set bit6
+            new = b | (1 << 6)
+        self.i2c_write_byte(dev, 10, new & 0xFF)
+
     # ---------------------------
     # Internal DACs (per MAT)
     # ---------------------------
