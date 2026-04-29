@@ -4,7 +4,7 @@ Spegne tutti i pixel della mattonella, poi accende solo ``CHANNEL`` e il TDC —
 di ``CalibrateFTDAC``, senza modificare i codici FineTune.
 """
 
-from ignite64py.macros_library import builtin_isolate_one_channel
+from icboost.macros_library import builtin_isolate_one_channel
 
 # --- Parametri operativi ---
 MAT = 0

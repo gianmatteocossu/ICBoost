@@ -3,7 +3,7 @@ Macro: lettura e stampa codici FineTune (0..15) per tutti i 64 canali della MAT
 Sola lettura; utile per log prima/dopo calibrazione o dopo ``ftdac_incrementa_mat``.
 """
 
-from ignite64py.macros_library import builtin_ftdac_dump
+from icboost.macros_library import builtin_ftdac_dump
 
 # --- Parametri operativi ---
 MAT = 0

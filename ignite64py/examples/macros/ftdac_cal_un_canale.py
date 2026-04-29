@@ -3,7 +3,7 @@ Macro: calibrazione FTDAC su un canale (FIFO)
 Calibrazione soglia FineTune per un solo indice pixel sulla mattonella impostata.
 """
 
-from ignite64py.macros_library import builtin_ftdac_cal_ch
+from icboost.macros_library import builtin_ftdac_cal_ch
 
 # --- Parametri operativi ---
 MAT = 0

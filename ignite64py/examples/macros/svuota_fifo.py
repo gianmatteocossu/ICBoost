@@ -4,7 +4,7 @@ Legge e scarta fino a FIFO vuota o fino al limite ``MAX_WORDS``. Eseguire dopo `
 se serve una linea pulita prima di trigger o calibrazione.
 """
 
-from ignite64py.macros_library import builtin_fifo_drain
+from icboost.macros_library import builtin_fifo_drain
 
 # --- Parametri operativi ---
 MAX_WORDS = 512

@@ -4,20 +4,24 @@ Questo file riassume **cosa contiene il repository** e **dove guardare**, così 
 
 ## Cos’è
 
-- **Monorepo** per lavoro su chip IGNITE64: applicazione **C#** di riferimento (`tb_Ignite64`, .NET Framework) e wrapper **Python** **`ignite64py`** che espone le stesse DLL USB/TCP (`TCPtoI2C.dll`, `USBtoI2C32.dll`) con API tipo `Ignite64` e GUI Tk.
+- **Monorepo** per lavoro su chip IGNITE64: applicazione **C#** di riferimento (`tb_Ignite64`, .NET Framework) e wrapper **Python** **ICBoost** (`import icboost`) che espone le stesse DLL USB/TCP (`TCPtoI2C.dll`, `USBtoI2C32.dll`) con API tipo `Ignite64` e GUI Tk.
 
 ## Percorsi chiave (Python)
 
+La cartella progetto si chiama in genere **`icboost/`** (contiene `pyproject.toml`); in working copy non ancora rinominate può comparire come `ignite64py/`.
+
 | Percorso | Ruolo |
 |----------|--------|
-| `ignite64py/ignite64py/api.py` | API alto livello: FIFO, TOP, pixel, DAC, FTDAC, `CalibrateFTDAC`, caricamento config. |
-| `ignite64py/ignite64py/device.py` | I2C, `select_quadrant`, trasporto DLL. |
-| `ignite64py/ignite64py/gui_tk.py` | GUI monitor; `run_gui()` avvio; navigazione Quadrants / blocchi / analog. |
-| `ignite64py/ignite64py/macros_library.py` | Funzioni `builtin_*` usate dalle macro GUI. |
-| `ignite64py/examples/gui_monitor.py` | Entrypoint GUI tipico (`OFFLINE` default 1). |
-| `ignite64py/examples/macros/*.py` | Macro `source nome.py` dalla GUI. |
-| `ignite64py/docs/GUIDA_HW_E_MACRO.md` | Riferimento API e macro (dettagliato). |
-| `ignite64py/docs/INSTALLAZIONE_WINDOWS.md` | Setup Python, Pillow, DLL, variabili ambiente. |
+| `<cartella-progetto>/icboost/api.py` | API alto livello: FIFO, TOP, pixel, DAC, FTDAC, `CalibrateFTDAC`, caricamento config. |
+| `<cartella-progetto>/icboost/device.py` | I2C, `select_quadrant`, trasporto DLL. |
+| `<cartella-progetto>/icboost/gui_tk.py` | GUI monitor; `run_gui()` avvio; navigazione Quadrants / blocchi / analog. |
+| `<cartella-progetto>/icboost/macros_library.py` | Funzioni `builtin_*` usate dalle macro GUI. |
+| `<cartella-progetto>/examples/gui_monitor.py` | Entrypoint GUI tipico (`OFFLINE` default 1). |
+| `<cartella-progetto>/examples/macros/*.py` | Macro `source nome.py` dalla GUI. |
+| `<cartella-progetto>/docs/GUIDA_HW_E_MACRO.md` | Riferimento API e macro (dettagliato). |
+| `<cartella-progetto>/docs/INSTALLAZIONE_WINDOWS.md` | Setup Python, Pillow, DLL, variabili ambiente. |
+
+Oggi `<cartella-progetto>` può essere ancora `ignite64py/`; dopo la rinomina in `icboost/` i percorsi relativi alla radice del repo restano gli stessi sostituendo solo quel prefisso.
 
 ## Convenzioni
 

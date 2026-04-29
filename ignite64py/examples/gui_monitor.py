@@ -2,7 +2,7 @@ import os
 import sys
 from pathlib import Path
 
-# Force this repository's package before any older ignite64py on PYTHONPATH/site-packages
+# Force this repository's package before any older icboost on PYTHONPATH/site-packages
 # (otherwise assets/ignite64.jpg next to gui_tk.py is never seen).
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -12,17 +12,29 @@ try:
     from PIL import Image as _PIL_die_photo_requires_pillow  # noqa: F401
 except ImportError:
     print(
-        "\n*** ignite64 GUI: serve Pillow per caricare ignite64.jpg (foto del die). ***\n"
+        "\n*** ICBoost GUI: serve Pillow per caricare ignite64.jpg (foto del die). ***\n"
         f"    Interprete usato ora: {sys.executable}\n"
         "    Installazione (stesso Python con cui lanci questo script):\n"
         "      python -m pip install pillow\n"
-        "    Oppure: pip install -e .   dalla cartella ignite64py (installa le dipendenze del progetto).\n",
+        "    Oppure: pip install -e .   dalla cartella progetto icboost (installa le dipendenze del progetto).\n",
         file=sys.stderr,
     )
 
-# Point IGNITE_DIE_PHOTO at repo assets even when an older ignite64py on sys.path shadows sources
+# Point IGNITE_DIE_PHOTO at repo assets even when an older icboost on sys.path shadows sources
 # (site-packages copy often has no ignite64.jpg → gray quadrant fallback).
-_repo_assets = _REPO / "ignite64py" / "ignite64py" / "assets"
+def _resolve_repo_assets() -> Path:
+    for parts in (
+        ("icboost", "icboost", "assets"),
+        ("ignite64py", "icboost", "assets"),
+        ("ignite64py", "ignite64py", "assets"),
+    ):
+        p = _REPO.joinpath(*parts)
+        if p.is_dir():
+            return p
+    return _REPO / "icboost" / "icboost" / "assets"
+
+
+_repo_assets = _resolve_repo_assets()
 _die_raw = os.environ.get("IGNITE_DIE_PHOTO", "").strip().strip('"').strip("'")
 _need_die = True
 if _die_raw:
@@ -42,7 +54,7 @@ if _need_die:
 if "OFFLINE" not in os.environ:
     os.environ["OFFLINE"] = "1"
 
-from ignite64py.gui_tk import run_gui
+from icboost.gui_tk import run_gui
 
 
 if __name__ == "__main__":

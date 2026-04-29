@@ -4,7 +4,7 @@ Imposta ``TopReadout('i2c')`` e seleziona il quadrante del menu «Quadrant». Da
 ``CalibrateFTDAC``, ``FifoDrain`` o letture hit se il readout non è già su I2C.
 """
 
-from ignite64py.macros_library import builtin_prepare_fifo_readout
+from icboost.macros_library import builtin_prepare_fifo_readout
 
 
 def prepare_fifo_readout(hw, quad):

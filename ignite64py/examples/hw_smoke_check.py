@@ -1,7 +1,7 @@
 """
 Checklist HW rapida da eseguire dopo molto tempo senza banco (o dopo aggiornamenti software).
 
-Uso (dalla cartella ``ignite64py`` o con PYTHONPATH che punta al repo):
+Uso (dalla cartella progetto ``icboost`` — o ``ignite64py`` se non rinominata — oppure con PYTHONPATH sul repo):
 
   python examples/hw_smoke_check.py
 
@@ -34,7 +34,7 @@ def main() -> None:
     dll_dir = str(Path(__file__).resolve().parents[1])
     sys.path.insert(0, dll_dir)
 
-    from ignite64py.api import Ignite64
+    from icboost.api import Ignite64
 
     quad = os.environ.get("QUAD", "SW").strip().upper()
     serial_env = os.environ.get("SERIAL", "").strip()

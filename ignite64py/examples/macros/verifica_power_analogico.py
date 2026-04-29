@@ -3,7 +3,7 @@ Macro: lettura stato alimentazione analogica globale (IOext)
 Il risultato non dipende dal quadrante del menu; ``quad`` è comunque passato dalla GUI.
 """
 
-from ignite64py.macros_library import builtin_read_analog_power_state
+from icboost.macros_library import builtin_read_analog_power_state
 
 
 def verifica_power_analogico(hw, quad):

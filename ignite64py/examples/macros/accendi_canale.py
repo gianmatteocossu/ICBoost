@@ -3,7 +3,7 @@ Macro: accensione singolo canale
 Imposta PIXON per un solo pixel (mattonella + indice 0..63) nel quadrante del menu «Quadrant».
 """
 
-from ignite64py.macros_library import builtin_pixel_on
+from icboost.macros_library import builtin_pixel_on
 
 # --- Parametri operativi ---
 MAT = 0

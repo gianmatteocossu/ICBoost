@@ -8,9 +8,9 @@ from typing import Any, Dict
 
 
 def main() -> None:
-    from ignite64py.api import Ignite64
-    from ignite64py.device import Ignite64Addresses
-    from ignite64py.device import Ignite64TransportError
+    from icboost.api import Ignite64
+    from icboost.device import Ignite64Addresses
+    from icboost.device import Ignite64TransportError
 
     # Defaults
     SW, NW, SE, NE, ALL = "SW", "NW", "SE", "NE", "ALL"

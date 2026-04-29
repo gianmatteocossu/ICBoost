@@ -4,7 +4,7 @@ Esegue una calibrazione FIFO per ogni indice in ``CHANNELS`` sulla ``MAT`` indic
 Il quadrante è quello del menu «Quadrant».
 """
 
-from ignite64py.macros_library import builtin_ftdac_cal_channels
+from icboost.macros_library import builtin_ftdac_cal_channels
 
 # --- Parametri operativi ---
 MAT = 0

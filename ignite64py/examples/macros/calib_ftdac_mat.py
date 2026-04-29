@@ -4,7 +4,7 @@ Esegue ``CalibrateFTDAC(..., Channel='ALL')``: tutti i 64 canali in sequenza.
 Durata elevata; richiede readout TOP su I2C, FIFO accessibile, banco stabile.
 """
 
-from ignite64py.macros_library import builtin_ftdac_cal_mat
+from icboost.macros_library import builtin_ftdac_cal_mat
 
 # --- Parametri operativi (0..15) ---
 MAT = 0

@@ -4,7 +4,7 @@ Accende 16×64 canali (tutte le mattonelle). Operazione lunga; verificare alimen
 Il quadrante è quello selezionato nel menu «Quadrant».
 """
 
-from ignite64py.macros_library import builtin_quad_all_pixels_on
+from icboost.macros_library import builtin_quad_all_pixels_on
 
 
 def accendi_quad_tutti(hw, quad):

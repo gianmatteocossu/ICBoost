@@ -29,4 +29,4 @@ Documentazione unificata API + builtin + flussi: **[`../../docs/GUIDA_HW_E_MACRO
 | `verifica_power_analogico.py` | — | Legge Analog Power globale. |
 | `esporta_snapshot_config.py` | `OUTPUT_PATH` | Salva snapshot TOP+MAT+IOext su file. |
 
-Implementazione condivisa: `ignite64py.macros_library` (`builtin_*`).
+Implementazione condivisa: `icboost.macros_library` (`builtin_*`).

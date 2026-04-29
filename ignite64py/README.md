@@ -1,4 +1,4 @@
-## ignite64py
+## ICBoost (`icboost`)
 
 Wrapper Python (Windows) per usare **le stesse DLL** del tool C# (`TCPtoI2C.dll`, `USBtoI2C32.dll`) e pilotare l'hardware via I2C con un'API ad alto livello.
 
@@ -11,7 +11,7 @@ Questo pacchetto vive di solito dentro un repository più ampio: alla **radice**
 ### Quick start
 
 ```python
-from ignite64py.api import Ignite64
+from icboost.api import Ignite64
 
 hw = Ignite64(dll_dir=r"C:\path\to\dlls")
 

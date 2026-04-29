@@ -1,6 +1,6 @@
 # Guida hardware, API `Ignite64` e macro
 
-Documento di riferimento per operatori che usano **ignite64py** da script, barra **Cmd** della GUI o macro **`source`**. Le funzioni sono realmente eseguite sul dispositivo: **ogni chiamata presuppone consapevolezza** di alimentazione, gestione termica, cablaggio e stato del chip.
+Documento di riferimento per operatori che usano **icboost** da script, barra **Cmd** della GUI o macro **`source`**. Le funzioni sono realmente eseguite sul dispositivo: **ogni chiamata presuppone consapevolezza** di alimentazione, gestione termica, cablaggio e stato del chip.
 
 **Installazione ambiente (Windows):** vedere **[INSTALLAZIONE_WINDOWS.md](INSTALLAZIONE_WINDOWS.md)** (Python, Pillow, DLL, avvio `gui_monitor.py`).
 
@@ -52,9 +52,9 @@ Documento di riferimento per operatori che usano **ignite64py** da script, barra
 
 ## 3. Oggetto `hw` e file sorgente
 
-- **`ignite64py.api.Ignite64`**: API ad alto livello (metodi elencati in §5).
-- **`ignite64py.device.Ignite64LowLevel`**: enumerazione USB/TCP, `select_quadrant`, lettura/scrittura I2C raw.
-- Per **firme esatte, eccezioni e commenti** inline, aprire sempre i file `ignite64py/api.py` e `ignite64py/device.py` nella propria revisione.
+- **`icboost.api.Ignite64`**: API ad alto livello (metodi elencati in §5).
+- **`icboost.device.Ignite64LowLevel`**: enumerazione USB/TCP, `select_quadrant`, lettura/scrittura I2C raw.
+- Per **firme esatte, eccezioni e commenti** inline, aprire sempre i file `icboost/api.py` e `icboost/device.py` nella propria revisione.
 
 ---
 
@@ -201,7 +201,7 @@ Ogni funzione `builtin_*` ha firma `(hw, quad, **kwargs)` salvo `pixels_all_off_
 | `fifo_drain` | … | `FifoDrain` con limite. |
 | `read_analog_power_state` | … | `readAnalogPower()`. |
 
-Invocazione programmatica: `from ignite64py.macros_library import run_builtin` oppure import diretto della `builtin_*`.
+Invocazione programmatica: `from icboost.macros_library import run_builtin` oppure import diretto della `builtin_*`.
 
 ---
 
@@ -261,7 +261,7 @@ print(hex(w))
 ### 8.4 Usare una builtin da script Python esterno
 
 ```python
-from ignite64py.macros_library import builtin_mat_summary
+from icboost.macros_library import builtin_mat_summary
 
 builtin_mat_summary(hw, "SW", mat=2)
 ```
@@ -299,7 +299,7 @@ hw.readTopSnapshot(quad)
 
 ## 10. Appendice: note sui registri
 
-Riassunto allineato al **README** del pacchetto `ignite64py`:
+Riassunto allineato al **README** del pacchetto `icboost`:
 
 - **PIX**: registro = `PixID` 0..63; bit6 = PIXON.
 - **DAC interni**: reg 70..75; bit7 enable + codice 7 bit.
@@ -310,4 +310,4 @@ Per il layout completo dei byte TOP/MAT dai file di configurazione, usare `snaps
 
 ---
 
-*Ultimo aggiornamento documentazione: allineato al modulo `ignite64py.api.Ignite64` nel repository sorgente.*
+*Ultimo aggiornamento documentazione: allineato al modulo `icboost.api.Ignite64` nel repository sorgente.*

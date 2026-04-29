@@ -3,7 +3,7 @@ Macro: spegnimento intera mattonella
 Spegne i 64 canali (0..63) della mattonella indicata nel quadrante del menu «Quadrant».
 """
 
-from ignite64py.macros_library import builtin_mat_all_pixels_off
+from icboost.macros_library import builtin_mat_all_pixels_off
 
 # --- Parametri operativi (0..15) ---
 MAT = 0

@@ -3,7 +3,7 @@ Macro: riepilogo stato MAT (pixel accesi, min/max FTDAC)
 Sola lettura I2C; non modifica la configurazione.
 """
 
-from ignite64py.macros_library import builtin_mat_summary
+from icboost.macros_library import builtin_mat_summary
 
 # --- Parametri operativi ---
 MAT = 0

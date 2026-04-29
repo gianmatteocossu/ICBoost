@@ -150,7 +150,7 @@ def rewrite_full_configuration_quadrant(
     - The following numeric Cur_Quad line (0..3)
 
     This is what the C# GUI uses to decide which quadrant to select; the actual mux
-    selection is performed when loading (we do that in ignite64py via select_quadrant()).
+    selection is performed when loading (we do that in icboost via select_quadrant()).
     """
     q = quadrant.strip().upper()
     if q not in _QUAD_TO_INDEX:

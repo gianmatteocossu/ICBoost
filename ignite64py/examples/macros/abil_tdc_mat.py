@@ -2,7 +2,7 @@
 Macro: abilitazione / disabilitazione TDC su una mattonella
 """
 
-from ignite64py.macros_library import builtin_tdc_mat
+from icboost.macros_library import builtin_tdc_mat
 
 # --- Parametri operativi ---
 MAT = 0

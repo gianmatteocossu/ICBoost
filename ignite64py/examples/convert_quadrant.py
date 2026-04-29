@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from ignite64py.config import rewrite_full_configuration_quadrant
+from icboost.config import rewrite_full_configuration_quadrant
 
 
 def main() -> None:

@@ -3,7 +3,7 @@ Macro: step su soglia discriminatore (VTHR_H o VTHR_L)
 Legge il codice DAC corrente sulla mattonella, applica ``delta`` (somma algebrica, clamp 0..127), rilegge.
 """
 
-from ignite64py.macros_library import builtin_vthr_bump
+from icboost.macros_library import builtin_vthr_bump
 
 # --- Parametri operativi ---
 MAT = 0

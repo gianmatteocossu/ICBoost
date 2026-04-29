@@ -3,7 +3,7 @@ Macro: accensione intera mattonella
 Accende tutti i 64 canali della mattonella specificata (quadrante = menu «Quadrant»).
 """
 
-from ignite64py.macros_library import builtin_mat_all_pixels_on
+from icboost.macros_library import builtin_mat_all_pixels_on
 
 # --- Parametri operativi (0..15) ---
 MAT = 0

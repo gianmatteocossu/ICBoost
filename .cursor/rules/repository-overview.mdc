@@ -1,11 +1,11 @@
 ---
-description: Panoramica repository IGNITE64 (Python + C# legacy)
+description: Panoramica repository IGNITE64 (Python ICBoost + C# legacy)
 alwaysApply: true
 ---
 
 # Repository tb_ignite64_source
 
-- Radice: progetto **C#** `tb_Ignite64` (.NET Framework) come riferimento GUI legacy; cartella **`ignite64py/`** = wrapper Python + Tk GUI + docs.
-- DLL **non** versionate di default (`.gitignore`: `*.dll`); istruzioni in `ignite64py/docs/INSTALLAZIONE_WINDOWS.md`.
+- Radice: progetto **C#** `tb_Ignite64` (.NET Framework) come riferimento GUI legacy; cartella **`icboost/`** = pacchetto Python ICBoost (`import icboost`) + Tk GUI + docs (in checkout vecchi può chiamarsi ancora `ignite64py/`).
+- DLL **non** versionate di default (`.gitignore`: `*.dll`); istruzioni in `icboost/docs/INSTALLAZIONE_WINDOWS.md` (percorso reale finché non rinomini: `ignite64py/docs/...`).
 - Per contesto esteso leggere **`AGENTS.md`** nella radice e **`CONTRIBUTING.md`** per clone/commit.
-- Documentazione operativa API/macro: **`ignite64py/docs/GUIDA_HW_E_MACRO.md`**.
+- Documentazione operativa API/macro: **`icboost/docs/GUIDA_HW_E_MACRO.md`** (o `ignite64py/docs/...` finché la cartella non è rinominata).

@@ -4,7 +4,7 @@ Spegne ogni canale (bit PIXON) su tutte le mattonelle 0..15 del quadrante attivo
 Nessun altro parametro: selezionare il quadrante corretto nel menu prima di Source.
 """
 
-from ignite64py.macros_library import builtin_pixels_all_off_quad
+from icboost.macros_library import builtin_pixels_all_off_quad
 
 
 def spegnitutto(hw, quad):

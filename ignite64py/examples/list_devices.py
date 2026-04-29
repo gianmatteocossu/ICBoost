@@ -1,4 +1,4 @@
-from ignite64py.api import Ignite64
+from icboost.api import Ignite64
 from pathlib import Path
 import platform
 

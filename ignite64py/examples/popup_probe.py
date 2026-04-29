@@ -23,10 +23,10 @@ def main() -> None:
     print("popup_probe.py: start")
 
     # Import inside main so we can see popups timing relative to import.
-    from ignite64py.api import Ignite64
-    from ignite64py.device import Ignite64Addresses
+    from icboost.api import Ignite64
+    from icboost.device import Ignite64Addresses
 
-    print("popup_probe.py: ignite64py imported")
+    print("popup_probe.py: icboost imported")
 
     dll_dir = str(Path(__file__).resolve().parents[1])
     addrs = Ignite64Addresses(mux_addr=0xE0, ioext_addr=0x40, top_addr=0xFC, strict=True)

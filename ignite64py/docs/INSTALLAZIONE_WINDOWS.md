@@ -1,6 +1,6 @@
 # Installazione e uso su Windows
 
-Guida per preparare l’ambiente **ignite64py** su Windows: interprete Python, dipendenze, DLL hardware, avvio della GUI e script di esempio.
+Guida per preparare l’ambiente **ICBoost** (modulo Python `icboost`) su Windows: interprete Python, dipendenze, DLL hardware, avvio della GUI e script di esempio. Se la cartella del progetto nel tuo clone si chiama ancora `ignite64py`, rinominala in `icboost` oppure adatta i percorsi dei comandi `cd` di conseguenza.
 
 ---
 
@@ -12,7 +12,7 @@ Guida per preparare l’ambiente **ignite64py** su Windows: interprete Python, d
 4. [Ambiente virtuale (consigliato)](#4-ambiente-virtuale-consigliato)
 5. [Dipendenze Python](#5-dipendenze-python)
 6. [DLL di comunicazione (hardware)](#6-dll-di-comunicazione-hardware)
-7. [Installare il pacchetto `ignite64py`](#7-installare-il-pacchetto-ignite64py)
+7. [Installare il pacchetto `icboost`](#7-installare-il-pacchetto-icboost)
 8. [Variabili d’ambiente utili](#8-variabili-dambiente-utili)
 9. [Avvio dell’interfaccia grafica (monitor)](#9-avvio-dellinterfaccia-grafica-monitor)
 10. [Altri modi d’uso](#10-altri-modi-duso)
@@ -53,10 +53,10 @@ Devono puntare allo stesso prefisso di installazione (es. `C:\Users\...\AppData\
 Dopo aver estratto o clonato il sorgente, la parte rilevante è in genere:
 
 ```text
-ignite64py\                    ← cartella **progetto** (contiene pyproject.toml)
+icboost\                    ← cartella **progetto** (contiene pyproject.toml)
   pyproject.toml
   requirements.txt
-  ignite64py\                  ← pacchetto Python importabile `ignite64py`
+  icboost\                  ← pacchetto Python importabile `icboost`
     assets\                    immagini die (es. ignite64.jpg), ecc.
     api.py, gui_tk.py, ...
   examples\
@@ -71,7 +71,7 @@ ignite64py\                    ← cartella **progetto** (contiene pyproject.tom
   ConfigurationFiles\          file di configurazione chip / SI5340 (usati da start_config)
 ```
 
-Le **DLL** del bridge USB/TCP vanno rese visibili al caricamento (vedi §6); molti script di esempio assumono le DLL nella cartella **`ignite64py`** stessa (livello di `pyproject.toml`), ossia la directory padre del pacchetto.
+Le **DLL** del bridge USB/TCP vanno rese visibili al caricamento (vedi §6); molti script di esempio assumono le DLL nella cartella **`icboost`** stessa (livello di `pyproject.toml`), ossia la directory padre del pacchetto.
 
 ---
 
@@ -80,7 +80,7 @@ Le **DLL** del bridge USB/TCP vanno rese visibili al caricamento (vedi §6); mol
 Isola le dipendenze dal sistema:
 
 ```text
-cd percorso\verso\ignite64py
+cd percorso\verso\icboost
 python -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
@@ -102,7 +102,7 @@ Installazione:
 python -m pip install -r requirements.txt
 ```
 
-oppure, dalla cartella progetto `ignite64py`:
+oppure, dalla cartella progetto `icboost`:
 
 ```text
 python -m pip install -e .
@@ -128,25 +128,25 @@ Il software usa le stesse DLL del tool C#:
 1. **Cartella nota + PATH**  
    Copiare le DLL in una cartella e aggiungerla alla variabile d’ambiente **PATH** utente o di sistema, **oppure**
 
-2. **Cartella del progetto `ignite64py`**  
+2. **Cartella del progetto `icboost`**  
    Posizionare `TCPtoI2C.dll` e `USBtoI2C32.dll` nella directory che contiene `pyproject.toml`. Su Python 3.8+ il caricamento può usare anche la directory delle DLL se gli script passano `dll_dir` a `Ignite64(...)` — gli esempi in `examples/` usano spesso la cartella padre del file come `dll_dir`.
 
 3. **`os.add_dll_directory`**  
-   Se si passa `dll_dir=` al costruttore `Ignite64`, il codice registra quella cartella per il caricamento DLL (vedi `ignite64py/dll.py`).
+   Se si passa `dll_dir=` al costruttore `Ignite64`, il codice registra quella cartella per il caricamento DLL (vedi `icboost/dll.py`).
 
 Se le DLL non sono trovate, si ottengono errori all’import o alla prima chiamata native.
 
 ---
 
-## 7. Installare il pacchetto `ignite64py`
+## 7. Installare il pacchetto `icboost`
 
-Dalla cartella **`ignite64py`** (quella con `pyproject.toml`):
+Dalla cartella **`icboost`** (quella con `pyproject.toml`):
 
 ```text
 python -m pip install -e .
 ```
 
-Così da qualsiasi directory puoi eseguire script che fanno `import ignite64py`, purché il venv sia attivo (o l’installazione sia nel Python di sistema).
+Così da qualsiasi directory puoi eseguire script che fanno `import icboost`, purché il venv sia attivo (o l’installazione sia nel Python di sistema).
 
 Senza installazione, è possibile aggiungere manualmente il percorso del progetto a `PYTHONPATH` o usare gli script in `examples/` che inseriscono il repo in `sys.path` (come `gui_monitor.py`).
 
@@ -159,7 +159,7 @@ Senza installazione, è possibile aggiungere manualmente il percorso del progett
 | **OFFLINE** | `1` = nessun accesso reale all’hardware (GUI e routine in modalità simulata/logica ridotta). `gui_monitor.py` imposta di default `OFFLINE=1` se non è già definita. Per il banco reale: `OFFLINE=0`. |
 | **START_CONFIG** | `1` (default in `gui_monitor`): all’avvio con hardware, viene chiamato `hw.start_config(...)` (USB, IOext, clock, caricamento TOP/MAT da file). `0` salta quel passaggio se vuoi collegarti senza riscrivere tutta la config. |
 | **QUAD** | Quadrante iniziale della GUI: `SW`, `NW`, `SE`, `NE`. |
-| **IGNITE_DIE_PHOTO** | Percorso file immagine del die (JPEG/PNG). Se assente, lo script può puntare automaticamente a `ignite64py/assets/ignite64.jpg`. |
+| **IGNITE_DIE_PHOTO** | Percorso file immagine del die (JPEG/PNG). Se assente, lo script può puntare automaticamente a `icboost/assets/ignite64.jpg`. |
 | **IGNITE_DIE_CHIP_BOX** | Rettangolo normalizzato sulla foto (left,top,right,bottom). |
 | **IGNITE_DIE_TOP_BAND** | Fascia “TOP” cliccabile sulla foto. |
 | **IGNITE64_DEBUG** | Debug trasporto I2C (vedi `device.py`). |
@@ -176,7 +176,7 @@ python examples\gui_monitor.py
 
 ## 9. Avvio dell’interfaccia grafica (monitor)
 
-Dalla cartella progetto **`ignite64py`** (con venv attivo e dipendenze installate):
+Dalla cartella progetto **`icboost`** (con venv attivo e dipendenze installate):
 
 ```text
 python examples\gui_monitor.py
@@ -187,7 +187,7 @@ Cosa succede (semplificato):
 - Carica Pillow; se manca, stampa istruzioni per `pip install pillow`.
 - Imposta eventuale `IGNITE_DIE_PHOTO` verso gli asset del repo.
 - Se **OFFLINE** non è impostata, la imposta a **1** (solo UI senza DLL HW — ideale per esplorare menu e navigazione).
-- Chiama `run_gui()` da `ignite64py.gui_tk`: crea `Ignite64()`, eventualmente `start_config` se non offline, e avvia la finestra **IGNITE64 monitor (tk)**.
+- Chiama `run_gui()` da `icboost.gui_tk`: crea `Ignite64()`, eventualmente `start_config` se non offline, e avvia la finestra **IGNITE64 monitor (tk)**.
 
 **Uso della GUI (panoramica)**
 
@@ -222,7 +222,7 @@ Tutti gli script assumono di essere lanciati dal contesto corretto di `PYTHONPAT
 | [`SVILUPPO_CURSOR.md`](SVILUPPO_CURSOR.md) | Clone, Cursor, `AGENTS.md`, `.cursor/rules/`. |
 | [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) | Git: primo commit, cosa versionare, DLL. |
 | [`../../README.md`](../../README.md) | Panoramica **intero repository** (Python + C#). |
-| [`../README.md`](../README.md) | Panoramica pacchetto `ignite64py` e quick start codice. |
+| [`../README.md`](../README.md) | Panoramica pacchetto `icboost` e quick start codice. |
 
 ---
 

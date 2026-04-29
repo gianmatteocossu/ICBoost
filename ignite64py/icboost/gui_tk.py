@@ -132,7 +132,7 @@ def _bootstrap_die_photo_env() -> None:
     If IGNITE_DIE_PHOTO is missing or points nowhere, set it to ignite64.jpg next to *this*
     source tree or typical checkout paths.
 
-    When Python loads ``ignite64py`` from site-packages, ``Path(__file__).parent/assets`` may be
+    When Python loads ``icboost`` from site-packages, ``Path(__file__).parent/assets`` may be
     empty even though the repo checkout has ignite64.jpg — without this, the GUI stays on the
     gray fallback.
     """
@@ -151,9 +151,14 @@ def _bootstrap_die_photo_env() -> None:
     try:
         cw = Path.cwd()
         for name in _DIE_PHOTO_NAMES:
-            candidates.append(cw / "ignite64py" / "ignite64py" / "assets" / name)
-            candidates.append(cw / "ignite64py" / "assets" / name)
-            candidates.append(cw / "assets" / name)
+            for base in (
+                cw / "icboost" / "icboost" / "assets",
+                cw / "ignite64py" / "icboost" / "assets",
+                cw / "ignite64py" / "ignite64py" / "assets",
+                cw / "ignite64py" / "assets",
+                cw / "assets",
+            ):
+                candidates.append(base / name)
             candidates.append(cw / name)
     except Exception:
         pass
@@ -162,7 +167,12 @@ def _bootstrap_die_photo_env() -> None:
             r = gt.parents[depth]
             for name in _DIE_PHOTO_NAMES:
                 candidates.append(r / name)
-                candidates.append(r / "ignite64py" / "ignite64py" / "assets" / name)
+                for base in (
+                    r / "icboost" / "icboost" / "assets",
+                    r / "ignite64py" / "icboost" / "assets",
+                    r / "ignite64py" / "ignite64py" / "assets",
+                ):
+                    candidates.append(base / name)
         except IndexError:
             break
 
@@ -481,7 +491,7 @@ class Ignite64Gui(tk.Tk):
         dirs.append(here / "assets")
 
         try:
-            import ignite64py as _pkg
+            import icboost as _pkg
 
             dirs.append(Path(_pkg.__file__).resolve().parent / "assets")
         except Exception:
@@ -490,7 +500,12 @@ class Ignite64Gui(tk.Tk):
         d = here
         for _ in range(10):
             dirs.append(d / "assets")
-            dirs.append(d / "ignite64py" / "ignite64py" / "assets")
+            for base in (
+                d / "icboost" / "icboost" / "assets",
+                d / "ignite64py" / "icboost" / "assets",
+                d / "ignite64py" / "ignite64py" / "assets",
+            ):
+                dirs.append(base)
             if d.parent == d:
                 break
             d = d.parent
@@ -498,6 +513,8 @@ class Ignite64Gui(tk.Tk):
         cw = Path.cwd()
         dirs.extend(
             (
+                cw / "icboost" / "icboost" / "assets",
+                cw / "ignite64py" / "icboost" / "assets",
                 cw / "ignite64py" / "ignite64py" / "assets",
                 cw / "ignite64py" / "assets",
                 cw / "assets",
@@ -569,25 +586,25 @@ class Ignite64Gui(tk.Tk):
             import importlib.resources as ir
 
             for fn in _DIE_PHOTO_NAMES:
-                ref = ir.files("ignite64py").joinpath("assets", fn)
+                ref = ir.files("icboost").joinpath("assets", fn)
                 if ref.is_file():
                     im = Image_mod.open(io.BytesIO(ref.read_bytes())).convert("RGBA")
-                    return im, f"ignite64py/assets/{fn} (importlib)"
+                    return im, f"icboost/assets/{fn} (importlib)"
         except Exception:
             pass
 
         for fn in _DIE_PHOTO_NAMES:
-            blob = pkgutil.get_data("ignite64py", f"assets/{fn}")
+            blob = pkgutil.get_data("icboost", f"assets/{fn}")
             if blob:
                 try:
                     im = Image_mod.open(io.BytesIO(blob)).convert("RGBA")
-                    return im, f"ignite64py/assets/{fn} (pkgutil)"
+                    return im, f"icboost/assets/{fn} (pkgutil)"
                 except Exception:
                     continue
 
         return (
             None,
-            "no die image — add ignite64py/assets/ignite64.jpg (or ignite64_die_photo.png) or set IGNITE_DIE_PHOTO",
+            "no die image — add icboost/assets/ignite64.jpg (or ignite64_die_photo.png) or set IGNITE_DIE_PHOTO",
         )
 
     # -----------------

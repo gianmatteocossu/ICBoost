@@ -3,7 +3,7 @@ Macro: incremento/decremento globale codici FTDAC (una mattonella)
 Applica lo stesso scostamento Δ a tutti i codici FineTune 0..15 (clamp incluso) sui 64 canali della MAT.
 """
 
-from ignite64py.macros_library import builtin_ftdac_delta_mat
+from icboost.macros_library import builtin_ftdac_delta_mat
 
 # --- Parametri operativi ---
 MAT = 0
