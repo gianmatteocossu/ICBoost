@@ -14,6 +14,10 @@ class Ignite64TransportError(RuntimeError):
     pass
 
 
+# C# `Ignite32_MATID_ToIntDevAddr`: MatID > 15 → 254 (broadcast MAT writes, e.g. DCOcal47).
+MAT_BROADCAST_DEV_ADDR = 254
+
+
 def _quad_to_mask(quad: str) -> int:
     q = quad.strip().upper()
     if q == "SW":
@@ -637,16 +641,29 @@ class Ignite64LowLevel:
 
     @staticmethod
     def matid_to_devaddr(mat_id: int) -> int:
-        # Copied from Ignite32_MATID_ToIntDevAddr: return 2 * abs(MatID)
-        if mat_id < 0 or mat_id > 15:
-            raise ValueError(f"mat_id out of range: {mat_id} (expected 0..15)")
-        # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
-        # Enforce a hard guard here so callers can't accidentally hit them.
-        # (Broadcast writes use special MAT IDs >15 -> dev 254 and are unaffected.)
-        if 4 <= int(mat_id) <= 7:
+        """
+        Map logical MAT id to 7-bit-style I2C device byte used by guarded reads/writes.
+
+        - MatID ``0..15`` (except 4..7, see below): ``2 * MatID`` like C# ``Ignite32_MATID_ToIntDevAddr``.
+        - Explicit broadcast address ``254`` (``MAT_BROADCAST_DEV_ADDR``): returned as-is for callers
+          that intentionally target broadcast (same convention as ``calib_dco._mat_write_addr`` for ``mid>15``).
+        - MatID ``4..7``: direct access raises ``Ignite64TransportError`` (known I2C bus stack issue);
+          use broadcast workflows (e.g. DCOcal47) instead of this helper for those MATs.
+
+        Note: arbitrary ``MatID > 15`` is **not** mapped to 254 here (unlike C#), to avoid typos silently
+        becoming broadcast; pass ``254`` explicitly.
+        """
+        mid = int(mat_id)
+        if mid == MAT_BROADCAST_DEV_ADDR:
+            return 254
+        if mid < 0 or mid > 15:
+            raise ValueError(
+                f"mat_id out of range: {mat_id} (expected 0..15, or {MAT_BROADCAST_DEV_ADDR} for broadcast)"
+            )
+        if 4 <= mid <= 7:
             raise Ignite64TransportError(
                 f"Direct MAT access disabled for mat_id={mat_id} (known I2C stack issue on MAT 4..7). "
                 "Use broadcast/CalibDCO47 workaround."
             )
-        return 2 * abs(mat_id)
+        return 2 * abs(mid)
 

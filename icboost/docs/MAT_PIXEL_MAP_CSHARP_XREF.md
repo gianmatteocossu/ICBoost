@@ -67,3 +67,8 @@ Se in documentazione o commenti compare **0, 2, 8, 10** come “mat di controllo
 | FIFO | `FifoReadSingle`, `FifoReadNumWords`, burst I2C TOP |
 
 Python: stessi nomi ad alto livello in `icboost/api.py` + `device.py`.
+
+## `matid_to_devaddr` (Python) vs C#
+
+- C# `Ignite32_MATID_ToIntDevAddr`: `MatID > 15` → **254** (broadcast).
+- Python `Ignite64LowLevel.matid_to_devaddr`: accetta **solo** `0..15` (con blocco **4..7**) oppure **`254` esplicito** per broadcast; `MatID == 16` ecc. **non** viene mappato silenziosamente a 254 (evita errori di battitura). Costante: `MAT_BROADCAST_DEV_ADDR` in `device.py`.

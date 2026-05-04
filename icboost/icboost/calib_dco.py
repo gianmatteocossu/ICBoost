@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .device import Ignite64TransportError
+from .device import Ignite64TransportError, MAT_BROADCAST_DEV_ADDR
 
 # MAT registers (same as `MatRegs` in api.py)
 _REG_CAL_CONF = 67
@@ -21,8 +21,8 @@ _REG_MAT_COMMAND = 112
 
 QUAD_INDEX_TO_STR = ("SW", "NW", "SE", "NE")
 
-# C# uses MAT ID 254 as broadcast for DCOcal47
-MAT_BROADCAST_ID = 254
+# C# uses MAT ID >15 → dev 254 for broadcast (DCOcal47); keep name used across macros/tests.
+MAT_BROADCAST_ID = MAT_BROADCAST_DEV_ADDR
 
 
 def raw_fifo_to_fields(data_fifo_raw: int) -> dict[str, object]:

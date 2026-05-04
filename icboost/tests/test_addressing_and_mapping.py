@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from icboost.device import Ignite64LowLevel, Ignite64TransportError, _quad_to_mask
+from icboost.device import Ignite64LowLevel, Ignite64TransportError, MAT_BROADCAST_DEV_ADDR, _quad_to_mask
 from icboost.gui_tk import BlockMapping
 from icboost.calib_dco import raw_fifo_to_fields, _dco_period_ps, MAT_BROADCAST_ID
 
@@ -36,12 +36,21 @@ class TestMatIdToDevAddrMatchesCSharp:
 
     def test_broadcast_id_constant(self) -> None:
         assert MAT_BROADCAST_ID == 254
+        assert MAT_BROADCAST_DEV_ADDR == 254
         assert _csharp_matid_to_int_dev_addr(16) == 254
         assert _csharp_matid_to_int_dev_addr(254) == 254
+
+    def test_matid_explicit_254_broadcast_address(self) -> None:
+        assert Ignite64LowLevel.matid_to_devaddr(MAT_BROADCAST_DEV_ADDR) == 254
 
     def test_mat_id_negative_rejected_in_python(self) -> None:
         with pytest.raises(ValueError):
             Ignite64LowLevel.matid_to_devaddr(-1)
+
+    def test_mat_id_16_does_not_silently_map_to_broadcast(self) -> None:
+        """C# maps MatID>15 to 254; Python requires explicit ``254`` to avoid typos."""
+        with pytest.raises(ValueError):
+            Ignite64LowLevel.matid_to_devaddr(16)
 
 
 class TestQuadMuxMask:

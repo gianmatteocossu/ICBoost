@@ -86,10 +86,10 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 
 | Metodo | Significato |
 |--------|-------------|
-| `FifoReadSingle() -> int` | Una parola 64 bit; `0` se FIFO vuota (rc vendor 3). |
+| `FifoReadSingle() -> int` | Una parola 64 bit; `0` se FIFO vuota (**rc==3**). Attenzione: un hit reale con parola **numericamente 0** non è distinguibile da “vuoto” con questa sola API. |
 | `FifoReadSingleRobust(..., quad=?, retries=?, backoff_s=?, do_bus_recovery=?, ensure_i2c_readout=?) -> int` | Come `FifoReadSingle`, con **retry** e tentativo di **bus recovery**; utile in loop di calibrazione quando il bridge restituisce errori transitori (es. `rc=1`). |
 | `FifoReadNumWords(n_words: 1..24) -> list[int]` | Burst di parole. |
-| `FifoDrain(max_words=4096) -> list[int]` | Svuota fino a vuoto o limite. |
+| `FifoDrain(max_words=4096) -> list[int]` | Svuota usando **rc** del bridge: si ferma solo su **rc==3** (FIFO vuota), così una parola valida **0x0000…00** non viene persa. |
 
 **Prerequisito**: readout TOP su **I2C** (`TopReadout("i2c")`) affinché la FIFO sia leggibile dal bridge.
 
@@ -166,10 +166,10 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 | Metodo | Significato |
 |--------|-------------|
 | `snapshot_full_configuration(quad, path=)` | Esporta testo TOP + MAT + IOext. |
-| `load_full_configuration(path)` | Carica file configurazione completo. |
+| `load_full_configuration(path)` | Carica file configurazione completo; sezioni **MAT 4..7** vengono **saltate** (accesso diretto disabilitato come in `start_config`). |
 | `load_ioext_and_mux_from_full_configuration(path)` | |
 | `apply_ioext_registers_from_full_configuration(path, regs)` | |
-| `load_top_and_mats_from_full_configuration(path)` | |
+| `load_top_and_mats_from_full_configuration(path)` | Come sopra per le MAT: **salta MAT 4..7**. |
 | `loadClockSetting(path)` | SI5340. |
 
 ### 5.10 Calibrazione DCO

@@ -61,6 +61,20 @@ class Ignite64(Ignite64LowLevel):
     # FIFO readout (TOP)
     # ---------------------------
 
+    def _fifo_top_read_u64_rc(self) -> tuple[int, int]:
+        """
+        Raw FIFO read: ``(rc, u64)`` little-endian from TOP subaddress 0x40.
+        ``rc == 3`` means FIFO empty (vendor convention); ``u64`` is then undefined (returned as 0).
+        ``rc == 0`` means one valid word (including if the 64-bit value is numerically 0).
+        """
+        dev = int(self.addr.top_addr) & 0xFF
+        rc, data = self.i2c_read_bytes_rc(dev, 0x40, 8)
+        if rc == 0 and len(data) >= 8:
+            return rc, int.from_bytes(data[:8], byteorder="little", signed=False)
+        if rc == 3:
+            return rc, 0
+        raise Ignite64TransportError(f"FifoRead: I2C_ReadArray(dev=0x{dev:02X}, sub=0x40, n=8) -> {rc}")
+
     def FifoReadSingle(self) -> int:
         """
         Read one 64-bit FIFO word via I2C readout interface.
@@ -68,15 +82,14 @@ class Ignite64(Ignite64LowLevel):
         Mapping from C# `FifoReadSingle()`:
           I2C_ReadArray(dev=TOP(0xFC), subaddr=0x40, n=8) and interpret as little-endian u64.
 
-        Vendor return code rc==3 is treated as "FIFO empty" and returns 0.
+        Vendor return code rc==3 is treated as "FIFO empty" and returns **0**, which is ambiguous
+        with a legitimate all-zero FIFO word; use ``FifoDrain`` (rc-aware) or ``_fifo_top_read_u64_rc``
+        if you must distinguish empty vs zero.
         """
-        dev = int(self.addr.top_addr) & 0xFF
-        rc, data = self.i2c_read_bytes_rc(dev, 0x40, 8)
-        if rc == 0 and len(data) >= 8:
-            return int.from_bytes(data[:8], byteorder="little", signed=False)
+        rc, w = self._fifo_top_read_u64_rc()
         if rc == 3:
             return 0
-        raise Ignite64TransportError(f"FifoReadSingle: I2C_ReadArray(dev=0x{dev:02X}, sub=0x40, n=8) -> {rc}")
+        return int(w)
 
     def FifoReadSingleRobust(
         self,
@@ -106,7 +119,10 @@ class Ignite64(Ignite64LowLevel):
                         self.TopReadout("i2c")
                     except Exception:
                         pass
-                return int(self.FifoReadSingle())
+                rc, w = self._fifo_top_read_u64_rc()
+                if rc == 3:
+                    return 0
+                return int(w)
             except Exception as e:
                 last_err = e
                 if do_bus_recovery:
@@ -155,17 +171,20 @@ class Ignite64(Ignite64LowLevel):
 
     def FifoDrain(self, *, max_words: int = 4096) -> list[int]:
         """
-        Read FIFO until empty (or max_words reached). Returns list of u64 raw words.
+        Read FIFO until vendor reports empty (rc==3) or ``max_words`` reached.
+
+        Uses return codes from the DLL: **does not** treat an all-zero u64 as empty (unlike a naive
+        ``while FifoReadSingle() != 0`` loop, which would stop early on a valid zero word).
         """
         max_words = int(max_words)
         if max_words < 0:
             raise ValueError("max_words must be >= 0")
         out: list[int] = []
         for _ in range(max_words):
-            w = int(self.FifoReadSingle())
-            if w == 0:
+            rc, w = self._fifo_top_read_u64_rc()
+            if rc == 3:
                 break
-            out.append(w)
+            out.append(int(w))
         return out
 
     # ---------------------------
@@ -263,6 +282,36 @@ class Ignite64(Ignite64LowLevel):
         def _clear_fifo() -> None:
             _ = self.FifoDrain(max_words=4096)
 
+        def _probe_fifo_hit() -> tuple[bool, int]:
+            """
+            After FTDAC stimulus: return (empty, word). ``empty`` is True only when vendor rc==3.
+            Retries on transient I2C errors (same spirit as ``FifoReadSingleRobust``).
+            """
+            last_err: Optional[Exception] = None
+            for i in range(6):
+                try:
+                    self.select_quadrant(quad)
+                    try:
+                        self.TopReadout("i2c")
+                    except Exception:
+                        pass
+                    rc, w = self._fifo_top_read_u64_rc()
+                    if rc == 3:
+                        return True, 0
+                    if rc != 0:
+                        raise Ignite64TransportError(f"FIFO read rc={rc}")
+                    return False, int(w)
+                except Exception as e:
+                    last_err = e
+                    try:
+                        self.i2c_bus_recovery()
+                    except Exception:
+                        pass
+                    time.sleep(0.003 * float(i + 1))
+            if last_err is not None:
+                raise last_err
+            return True, 0
+
         def _calibrate_one(ch: int) -> dict[str, object]:
             if ch < 0 or ch > 63:
                 raise ValueError("Channel out of range (expected 0..63)")
@@ -285,9 +334,8 @@ class Ignite64(Ignite64LowLevel):
 
                 _clear_fifo()
                 time.sleep(0.01)
-                w = int(self.FifoReadSingle())
-
-                if w == 0:
+                empty, w = _probe_fifo_hit()
+                if empty:
                     prev_code = code
                     continue
 
@@ -324,6 +372,11 @@ class Ignite64(Ignite64LowLevel):
         mat = int(Mattonella)
         if mat < 0 or mat > 15:
             raise ValueError("Mattonella out of range (expected 0..15)")
+        if 4 <= mat <= 7:
+            raise ValueError(
+                "CalibrateFTDAC: MAT 4..7 are not reachable via direct I2C in this wrapper "
+                "(bus stack issue). Use another MAT or a broadcast-specific workflow."
+            )
 
         # Ensure I2C readout is selected on TOP (needed for FIFO reads).
         try:
@@ -1404,7 +1457,11 @@ class Ignite64(Ignite64LowLevel):
         FineTune DAC per pixel: 4-bit.
         C# mapping (`MAT_DACset_refresh`): reg = 76 + pix//2, nibble low for even, high for odd.
 
-        Note: `block` is currently unused (kept for signature compatibility).
+        The I2C MAT device is selected **only** by ``mattonella`` (logical MatID 0..15, except 4..7
+        where direct access is blocked at ``matid_to_devaddr``). Parameter ``block`` is **not** used
+        to pick the analog “owner” MAT for a 2×2 block; callers must pass the correct ``mattonella``
+        themselves (typically **1, 3, 9, or 11** for column-style updates, matching C# / ``BlockMapping``).
+        ``block`` is kept for signature compatibility with legacy call sites (often ``0``).
         """
         self.select_quadrant(quad)
         if valore < 0 or valore > 15:
@@ -1696,6 +1753,9 @@ class Ignite64(Ignite64LowLevel):
         - TOP: write 19 bytes to dev 0xFC, regs 0..18
         - MAT: for each MAT section present: write 108 bytes to dev (2*MatID), regs 0..107
         - IOext: write 11 bytes to dev 0x40, regs 0..10
+
+        **MAT 4..7:** sections are **skipped** (same policy as ``start_config``): direct I2C to those
+        MATs can stack the bus. Re-apply those regions via broadcast tools if your flow requires them.
         """
         cfg = parse_full_configuration(path)
 
@@ -1708,6 +1768,12 @@ class Ignite64(Ignite64LowLevel):
 
         # MATs (only those included in the file)
         for mat_id, data in sorted(cfg.mats.items()):
+            if 4 <= int(mat_id) <= 7:
+                print(
+                    f"[WARN] load_full_configuration: skipping MAT {mat_id} "
+                    "(direct I2C disabled for MAT 4..7; section left unchanged on chip)"
+                )
+                continue
             dev = self.matid_to_devaddr(mat_id)
             self._write_block_bytewise(dev, 0, data)
 
@@ -1750,6 +1816,12 @@ class Ignite64(Ignite64LowLevel):
         # Then write the remaining TOP bytes (including re-writing reg0 if cfg.top[0] != 0xDC)
         self._write_block_bytewise(self.addr.top_addr, 0, cfg.top)
         for mat_id, data in sorted(cfg.mats.items()):
+            if 4 <= int(mat_id) <= 7:
+                print(
+                    f"[WARN] load_top_and_mats_from_full_configuration: skipping MAT {mat_id} "
+                    "(direct I2C disabled for MAT 4..7)"
+                )
+                continue
             dev = self.matid_to_devaddr(mat_id)
             self._write_block_bytewise(dev, 0, data)
 
