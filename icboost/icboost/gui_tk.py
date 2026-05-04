@@ -5066,6 +5066,44 @@ class Ignite64Gui(tk.Tk):
 
         return frm
 
+    def _schedule_blocks_view_redraw(self) -> None:
+        """If Quadrant→Blocks is open, nudge embedded canvases to redraw from ``_mat_snapshot_cache``."""
+        try:
+            cb = getattr(self, "_blocks_view_refresh_cb", None)
+            if callable(cb):
+                self.after(0, cb)
+        except Exception:
+            pass
+
+    def _sync_mat_snapshot_cache_pixel(self, qkey: str, mat_id: int, pix_id: int, *, pix_on: bool, fe_on: bool) -> None:
+        """
+        Merge one pixel into the global MAT snapshot so block overview tiles stay in sync with HW
+        (previously only FILE-prefill mode updated this cache, so colors lagged until re-navigation).
+        """
+        q = str(qkey).strip().upper()
+        if q not in {"SW", "NW", "SE", "NE"}:
+            return
+        mid = int(mat_id)
+        pid = int(pix_id)
+        if pid < 0 or pid > 63:
+            return
+        qc = self._mat_snapshot_cache.setdefault(q, {})
+        ent = qc.setdefault(mid, {})
+        po = ent.get("pix_on")
+        if not isinstance(po, list) or len(po) < 64:
+            po = [False] * 64
+        fo = ent.get("fe_on")
+        if not isinstance(fo, list) or len(fo) < 64:
+            fo = [True] * 64
+        ft = ent.get("ftdac")
+        if not isinstance(ft, list) or len(ft) < 64:
+            ft = [15] * 64
+        po[pid] = bool(pix_on)
+        fo[pid] = bool(fe_on)
+        ent["pix_on"] = po
+        ent["fe_on"] = fo
+        ent["ftdac"] = ft
+
     def _update_ftdac_cell(self, mat_id: int, pix_id: int, code: int) -> None:
         canvas = self._block_pix_canvas.get(int(mat_id))
         txts = self._block_pix_txt_ids.get(int(mat_id)) or []
@@ -5074,14 +5112,25 @@ class Ignite64Gui(tk.Tk):
                 canvas.itemconfigure(txts[pix_id], text=str(int(code)))
             except tk.TclError:
                 pass
-        # Keep FILE-prefilled cache coherent with GUI edits.
-        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
-            qkey = str(self.quad_var.get()).strip().upper()
-            entry = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
-            if isinstance(entry, dict):
-                ft = entry.get("ftdac")
-                if isinstance(ft, list) and pix_id < len(ft):
-                    ft[pix_id] = int(code) & 0x0F
+        qkey = str(self.quad_var.get()).strip().upper()
+        if qkey in {"SW", "NW", "SE", "NE"}:
+            qc = self._mat_snapshot_cache.setdefault(qkey, {})
+            ent = qc.setdefault(int(mat_id), {})
+            po = ent.get("pix_on")
+            if not isinstance(po, list) or len(po) < 64:
+                po = [False] * 64
+                ent["pix_on"] = po
+            fo = ent.get("fe_on")
+            if not isinstance(fo, list) or len(fo) < 64:
+                fo = [True] * 64
+                ent["fe_on"] = fo
+            ft = ent.get("ftdac")
+            if not isinstance(ft, list) or len(ft) < 64:
+                ft = [15] * 64
+            if int(pix_id) < len(ft):
+                ft[int(pix_id)] = int(code) & 0x0F
+            ent["ftdac"] = ft
+        self._schedule_blocks_view_redraw()
 
     def _update_pixel_fill_state(self, mat_id: int, pix_id: int, *, pix_on: bool, fe_on: bool) -> None:
         """
@@ -5101,14 +5150,9 @@ class Ignite64Gui(tk.Tk):
             except tk.TclError:
                 pass
 
-        # Keep FILE-prefilled cache coherent for PIXON (FEON not represented in cache today).
-        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
-            qkey = str(self.quad_var.get()).strip().upper()
-            entry = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
-            if isinstance(entry, dict):
-                po = entry.get("pix_on")
-                if isinstance(po, list) and int(pix_id) < len(po):
-                    po[int(pix_id)] = bool(pix_on)
+        qkey = str(self.quad_var.get()).strip().upper()
+        self._sync_mat_snapshot_cache_pixel(qkey, int(mat_id), int(pix_id), pix_on=bool(pix_on), fe_on=bool(fe_on))
+        self._schedule_blocks_view_redraw()
 
     def _open_ftdac_popup(self, mat_id: int, pix_id: int) -> None:
         quad = self.quad_var.get()
@@ -5611,15 +5655,6 @@ class Ignite64Gui(tk.Tk):
         except Exception:
             fe = True
         self._update_pixel_fill_state(int(mat_id), int(pix_id), pix_on=bool(new_state), fe_on=bool(fe))
-
-        # Keep FILE-prefilled cache coherent with GUI toggles.
-        if self._mat_snapshot_prefill_active and self._mat_snapshot_prefill_from_file:
-            qkey = str(quad).strip().upper()
-            entry = self._mat_snapshot_cache.get(qkey, {}).get(int(mat_id))
-            if isinstance(entry, dict):
-                po = entry.get("pix_on")
-                if isinstance(po, list) and pix_id < len(po):
-                    po[pix_id] = bool(new_state)
 
         self._set_status(f"Pixel {pix_id}={'ON' if new_state else 'OFF'} (Q={quad} MAT={mat_id})")
 
