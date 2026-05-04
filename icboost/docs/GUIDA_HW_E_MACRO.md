@@ -38,7 +38,9 @@ Documento di riferimento per operatori che usano **icboost** da script, barra **
 - Le **macro** in `examples/macros/` sono implementazioni che chiamano API testate; **non sostituiscono** il giudizio dell’operatore su ordine delle operazioni, limiti di corrente e stato del banco.
 - **FIFO / calibrazione FTDAC**: richiedono di norma `TopReadout("i2c")`, mux sul quadrante corretto e pixel/TDC configurati come da procedura; la macro `prepare_fifo_readout` imposta readout I2C + `select_quadrant`.
 - **MAT 4..7 (nota bus)**: su alcuni banchi l’indirizzamento I2C **diretto** verso MAT 4–7 può “stackare” il bus; in **icboost** le scritture MAT in `start_config` saltano 4–7 e molte azioni GUI su “tutto il quadrante” usano **broadcast** (dev 254) con lettura di verifica su MAT0. Le calibrazioni per-canale che richiedono accesso MAT-specifico possono essere limitate su quelle MAT.
-- **`AnalogChannelON` / `EnableDigPix`** con gli stessi indici agiscono sul **bit PIXON** del registro pixel (stesso percorso fisico); il nome cambia in base allo stile della API C# originale.
+- **`AnalogChannelON` / `AnalogChannelOFF` / `readAnalogChannelON` / `EnableDigPix` / `readEnableDigPix`**: stesso registro pixel per canale; agiscono solo sul **bit PIXON (bit6)** — uscita digitale del pixel. Il nome “AnalogChannel…” è **legacy dal C#** e non indica il front-end analogico.
+- **Front-end analogico per pixel (FEON)**: **`readAnalogFEON` / `setAnalogFEON`** sul **bit7** (`FE_ON` / ENPOW nel layout byte). **`readAnalogENPOW`** è alias di `readAnalogFEON` (bit7), non va confuso con PIXON.
+- **Alimentazione analogica globale** (scheda / IOext): `readAnalogPower` / `setAnalogPower` — concetto distinto sia da PIXON sia da FEON per-pixel.
 
 ---
 
@@ -108,9 +110,9 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 | Metodo | Significato |
 |--------|-------------|
 | `AnalogChannelON(quad, mattonella=, canale=)` / `AnalogChannelOFF(...)` | PIXON bit6. |
-| `readAnalogChannelON(quad, mattonella=, canale=) -> bool` | |
+| `readAnalogChannelON(quad, mattonella=, canale=) -> bool` | Lettura PIXON bit6. |
 | `EnableDigPix(quad, Mattonella=, Channel=, enable=)` | Stesso bit PIXON, naming “digitale”. |
-| `readEnableDigPix(quad, Mattonella=, Channel=) -> bool` | |
+| `readEnableDigPix(quad, Mattonella=, Channel=) -> bool` | Lettura PIXON bit6 (stesso di `readAnalogChannelON`). |
 | `readAnalogFEON(...) -> bool` / `setAnalogFEON(..., on=)` | FEON bit7 (front-end analogico); non modifica PIXON. |
 | `readAnalogENPOW(...)` | Stesso bit7 di FEON (alias di `readAnalogFEON`); **non** è PIXON. |
 | `EnableTDC(quad, Mattonella=, enable=, double_edge=?)` | TDC on/off per MAT. |
@@ -318,7 +320,7 @@ hw.readTopSnapshot(quad)
 
 Riassunto allineato al **README** del pacchetto `icboost`:
 
-- **PIX**: registro = `PixID` 0..63; bit6 = PIXON.
+- **PIX**: registro = `PixID` 0..63; **bit6 = PIXON** (digitale); **bit7 = FEON / FE_ON** (front-end analogico per quel pixel). `AnalogChannelON`/`OFF` toccano solo il bit6.
 - **DAC interni**: reg 70..75; bit7 enable + codice 7 bit.
 - **FineTune**: reg 76..107, due pixel per byte (nibble basso/alto).
 - **TOP TP**: reg 9..11 per impulso AFE / ripetizioni.
@@ -327,4 +329,4 @@ Per il layout completo dei byte TOP/MAT dai file di configurazione, usare `snaps
 
 ---
 
-*Ultimo aggiornamento documentazione: allineato al modulo `icboost.api.Ignite64` nel repository sorgente.*
+*Ultimo aggiornamento documentazione: allineato al modulo `icboost.api.Ignite64` (distinzione esplicita FEON bit7 vs PIXON bit6, nomi legacy C#).*

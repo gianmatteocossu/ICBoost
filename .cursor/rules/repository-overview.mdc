@@ -9,3 +9,4 @@ alwaysApply: true
 - DLL bridge **`TCPtoI2C.dll`** / **`USBtoI2C32.dll`** in **`icboost/`**; istruzioni aggiuntive in `icboost/docs/INSTALLAZIONE_WINDOWS.md`.
 - Per contesto esteso leggere **`AGENTS.md`** nella radice e **`CONTRIBUTING.md`** per clone/commit.
 - Documentazione operativa API/macro: **`icboost/docs/GUIDA_HW_E_MACRO.md`** (o `ignite64py/docs/...` finché la cartella non è rinominata).
+- API pixel: **`AnalogChannelON`/`OFF` = solo PIXON (bit6)**; **FEON analogico per-pixel = `setAnalogFEON`/`readAnalogFEON` (bit7)** — non scambiare con “Analog Power” globale (`readAnalogPower`).

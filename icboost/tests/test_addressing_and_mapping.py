@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from icboost.device import Ignite64LowLevel, _quad_to_mask
+from icboost.device import Ignite64LowLevel, Ignite64TransportError, _quad_to_mask
 from icboost.gui_tk import BlockMapping
 from icboost.calib_dco import raw_fifo_to_fields, _dco_period_ps, MAT_BROADCAST_ID
 
@@ -21,11 +21,18 @@ def _csharp_matid_to_int_dev_addr(mat_id: int) -> int:
 
 
 class TestMatIdToDevAddrMatchesCSharp:
-    """Ignite64LowLevel.matid_to_devaddr vs C# per MatID 0..15."""
+    """Ignite64LowLevel.matid_to_devaddr vs C# per MatID 0..15 (con guardia MAT 4..7)."""
 
-    @pytest.mark.parametrize("mat_id", range(16))
-    def test_range_0_15(self, mat_id: int) -> None:
+    @pytest.mark.parametrize("mat_id", [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15])
+    def test_range_matches_csharp_when_direct_access_allowed(self, mat_id: int) -> None:
         assert Ignite64LowLevel.matid_to_devaddr(mat_id) == _csharp_matid_to_int_dev_addr(mat_id)
+
+    @pytest.mark.parametrize("mat_id", [4, 5, 6, 7])
+    def test_mat_4_to_7_raises_transport_error(self, mat_id: int) -> None:
+        """Python blocca accesso diretto I2C a MAT 4..7 (stack bus documentato); C# restituirebbe 2*mat_id."""
+        with pytest.raises(Ignite64TransportError, match=r"MAT 4\.\.7"):
+            Ignite64LowLevel.matid_to_devaddr(mat_id)
+        assert _csharp_matid_to_int_dev_addr(mat_id) == 2 * mat_id
 
     def test_broadcast_id_constant(self) -> None:
         assert MAT_BROADCAST_ID == 254

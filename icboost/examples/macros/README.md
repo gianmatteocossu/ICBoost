@@ -4,6 +4,8 @@ Funzioni operative richiamabili dalla GUI (**Macro** → **Source**): `nome(hw, 
 
 Documentazione unificata API + builtin + flussi: **[`../../docs/GUIDA_HW_E_MACRO.md`](../../docs/GUIDA_HW_E_MACRO.md)**.
 
+Le macro che accendono/spegnono “canali” o “pixel” operano sul **bit PIXON (bit6)** (`AnalogChannelON`/`OFF`), non sul **FEON (bit7)** del front-end analogico, salvo dove esplicitamente indicato nella guida.
+
 ---
 
 ## Elenco file

@@ -28,7 +28,8 @@ Checklist veloce per verifica funzionalità **con hardware**. Incrociare con `do
 
 | # | Azione | Atteso |
 |---|--------|--------|
-| 3.1 | Accendi/spegni singolo canale (GUI o macro `accendi_canale` / `pixel_on`) | PIXON coerente readback |
+| 3.1 | Accendi/spegni singolo canale (GUI o macro `accendi_canale` / `pixel_on`) | PIXON (bit6) coerente con `readAnalogChannelON` |
+| 3.1b | FEON separato: checkbox / `setAnalogFEON` vs PIXON | Bit7 coerente con `readAnalogFEON`; `AnalogChannelOFF` non deve azzerare FEON se non richiesto |
 | 3.2 | FTDAC step su pochi canali | Codici 0..15, nibble basso/alternati reg 76..107 |
 | 3.3 | `readMatPixelsAndFTDAC` vs griglia C# stessa MAT | Stessi pattern |
 

@@ -28,6 +28,7 @@ Oggi `<cartella-progetto>` può essere ancora `ignite64py/`; dopo la rinomina in
 - Quadranti: stringhe `SW`, `NW`, `SE`, `NE`. MAT: `0..15`. Canale pixel: `0..63`.
 - Modifiche GUI: preferire patch piccole; non rimuovere commenti utili al mapping C#.
 - Macro: parametri in cima al file in `examples/macros/`; logica condivisa in `macros_library`.
+- Pixel: **`AnalogChannelON`/`OFF` = solo PIXON (bit6)**; front-end analogico per-pixel = **`setAnalogFEON`/`readAnalogFEON` (bit7)** — vedi `docs/GUIDA_HW_E_MACRO.md` §1 e §5.3 (il nome “AnalogChannel” è legacy C#).
 
 ## Binari e cosa resta fuori
 

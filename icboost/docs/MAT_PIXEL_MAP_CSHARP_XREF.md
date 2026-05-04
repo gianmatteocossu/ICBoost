@@ -52,7 +52,9 @@ Se in documentazione o commenti compare **0, 2, 8, 10** come “mat di controllo
 
 ## Pixel (canale)
 
-- Registri pixel **0..63** su ciascun MatID: bit PIXON = **bit6** del byte (allineamento C# `Ignite32_Mat_PIX_conf_noUI` / letture GUI).
+- Registri pixel **0..63** su ciascun MatID (byte per `PixID`, C# `Ignite32_Mat_PIX_conf_noUI` / GUI Python allineate):
+  - **bit6 = PIXON** (digitale) — `AnalogChannelON`/`OFF`, `readAnalogChannelON`, `EnableDigPix`.
+  - **bit7 = FEON / FE_ON** (front-end analogico) — `setAnalogFEON`, `readAnalogFEON` (alias `readAnalogENPOW`).
 - FTDAC: registri **76..107**, 2 pixel per byte (nibble basso/alto) — vedi `readMatPixelsAndFTDAC` in `icboost/api.py` e costanti `MatRegs` nello stesso file.
 
 ## Dove guardare in C#
