@@ -473,6 +473,9 @@ class Ignite64Gui(tk.Tk):
                 self._window_bg = "#f0f0f0"
             except Exception:
                 pass
+        self._icon_photo_ref: Optional[object] = None
+        # Delay icon setup: it tends to work better after the window exists.
+        self.after(50, self._set_app_icon)
 
         self._nav_stack: list[ttk.Frame] = []
 
@@ -924,7 +927,8 @@ class Ignite64Gui(tk.Tk):
             ep = Path(env)
             if ep.is_file():
                 try:
-                    return Image_mod.open(str(ep)).convert("RGBA"), str(ep)
+                    im = Image_mod.open(str(ep)).convert("RGBA")
+                    return self._banner_make_transparent(im), str(ep)
                 except Exception as e:
                     return None, f"IGNITE64_BANNER_PNG: {e}"
         base = Path(__file__).resolve().parent / "assets"
@@ -932,7 +936,8 @@ class Ignite64Gui(tk.Tk):
             fp = base / name
             if fp.is_file():
                 try:
-                    return Image_mod.open(str(fp)).convert("RGBA"), str(fp)
+                    im = Image_mod.open(str(fp)).convert("RGBA")
+                    return self._banner_make_transparent(im), str(fp)
                 except Exception:
                     continue
         try:
@@ -942,7 +947,7 @@ class Ignite64Gui(tk.Tk):
                 ref = ir.files("icboost").joinpath("assets", name)
                 if ref.is_file():
                     im = Image_mod.open(io.BytesIO(ref.read_bytes())).convert("RGBA")
-                    return im, f"icboost/assets/{name}"
+                    return self._banner_make_transparent(im), f"icboost/assets/{name}"
         except Exception:
             pass
         for name in _BANNER_IMAGE_NAMES:
@@ -950,10 +955,54 @@ class Ignite64Gui(tk.Tk):
             if blob:
                 try:
                     im = Image_mod.open(io.BytesIO(blob)).convert("RGBA")
-                    return im, f"icboost/assets/{name}"
+                    return self._banner_make_transparent(im), f"icboost/assets/{name}"
                 except Exception:
                     continue
         return None, "no banner — add icboost/assets/ignite_ud_banner.png or set IGNITE64_BANNER_PNG"
+
+    def _banner_make_transparent(self, im: object) -> object:
+        """
+        Make white-ish banner background transparent so it blends with the ttk window background.
+        Best-effort: if Pillow APIs change/missing, returns the original image.
+        """
+        try:
+            try:
+                from PIL import ImageChops  # type: ignore[import-not-found]
+            except Exception:
+                ImageChops = None  # type: ignore[assignment]
+
+            # Use top-left pixel as background reference (usually white).
+            px = im.getpixel((0, 0))
+            if not (isinstance(px, tuple) and len(px) >= 3):
+                return im
+            br, bg, bb = int(px[0]), int(px[1]), int(px[2])
+            # If the corner isn't bright, fall back to "near-white".
+            corner_bright = (br + bg + bb) / 3.0
+            if corner_bright < 200:
+                br, bg, bb = 255, 255, 255
+            tol = 28  # background tolerance
+
+            r, g, b, a = im.split()
+
+            def _mask(v: int, ref: int) -> int:
+                return 255 if abs(int(v) - int(ref)) <= tol else 0
+
+            mr = r.point(lambda v: _mask(v, br))
+            mg = g.point(lambda v: _mask(v, bg))
+            mb = b.point(lambda v: _mask(v, bb))
+
+            if ImageChops is None:
+                return im
+            # bg_mask = pixels that match background in all channels (0/255 mask)
+            bg_mask = ImageChops.multiply(ImageChops.multiply(mr, mg), mb)
+
+            # New alpha: keep original alpha, but set to 0 where bg_mask is 255.
+            inv = bg_mask.point(lambda v: 255 - int(v))
+            new_a = ImageChops.multiply(a, inv)
+            im.putalpha(new_a)
+            return im
+        except Exception:
+            return im
 
     # -----------------
     # Navigation helpers
@@ -1620,6 +1669,245 @@ class Ignite64Gui(tk.Tk):
 
         return out
 
+    def _open_fifo_analyze_popup(self, quad: str, samples: list[dict[str, object]]) -> None:
+        """
+        Analyze FIFO decoded samples:
+        - filter by MAT/CH
+        - TA histogram (with std dev)
+        - TOT histogram
+        - TA vs TOT scatter (time-walk view)
+        """
+        q = str(quad).strip().upper()
+        win = tk.Toplevel(self)
+        win.title(f"Analyze FIFO data — Q={q}")
+        win.transient(self)
+        win.resizable(True, True)
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        # Controls
+        ctrl = ttk.Frame(root)
+        ctrl.grid(row=0, column=0, sticky="ew")
+        ctrl.columnconfigure(10, weight=1)
+
+        use_filter = tk.BooleanVar(value=True)
+        mat_var = tk.StringVar(value="0")
+        ch_var = tk.StringVar(value="0")
+
+        ttk.Checkbutton(ctrl, text="Filter MAT/CH", variable=use_filter).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(ctrl, text="MAT").grid(row=0, column=1, sticky="w")
+        ttk.Spinbox(ctrl, from_=0, to=15, width=5, textvariable=mat_var).grid(row=0, column=2, sticky="w", padx=(6, 12))
+        ttk.Label(ctrl, text="CH").grid(row=0, column=3, sticky="w")
+        ttk.Spinbox(ctrl, from_=0, to=63, width=5, textvariable=ch_var).grid(row=0, column=4, sticky="w", padx=(6, 12))
+
+        stats_var = tk.StringVar(value="—")
+        ttk.Label(ctrl, textvariable=stats_var, font=("Segoe UI", 9)).grid(row=0, column=5, sticky="w")
+
+        # Plots
+        nb = ttk.Notebook(root)
+        nb.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+
+        tab_ta = ttk.Frame(nb, padding=8)
+        tab_tot = ttk.Frame(nb, padding=8)
+        tab_sc = ttk.Frame(nb, padding=8)
+        nb.add(tab_ta, text="TA distribution")
+        nb.add(tab_tot, text="TOT distribution")
+        nb.add(tab_sc, text="TA vs TOT")
+
+        cv_ta = tk.Canvas(tab_ta, bg="white", highlightthickness=1, highlightbackground="#cfd8dc", height=320)
+        cv_tot = tk.Canvas(tab_tot, bg="white", highlightthickness=1, highlightbackground="#cfd8dc", height=320)
+        cv_sc = tk.Canvas(tab_sc, bg="white", highlightthickness=1, highlightbackground="#cfd8dc", height=320)
+        cv_ta.pack(fill="both", expand=True)
+        cv_tot.pack(fill="both", expand=True)
+        cv_sc.pack(fill="both", expand=True)
+
+        def _safe_float(x: object) -> Optional[float]:
+            try:
+                if x is None:
+                    return None
+                return float(x)  # type: ignore[arg-type]
+            except Exception:
+                return None
+
+        def _filter_samples() -> tuple[list[float], list[float]]:
+            try:
+                want_mat = int(str(mat_var.get()).strip())
+            except Exception:
+                want_mat = 0
+            try:
+                want_ch = int(str(ch_var.get()).strip())
+            except Exception:
+                want_ch = 0
+            want_mat = max(0, min(15, want_mat))
+            want_ch = max(0, min(63, want_ch))
+
+            tas: list[float] = []
+            tots: list[float] = []
+            for d in samples:
+                try:
+                    if bool(use_filter.get()):
+                        if int(d.get("mat", -1) or -1) != want_mat:
+                            continue
+                        if int(d.get("channel", -1) or -1) != want_ch:
+                            continue
+                    ta = _safe_float(d.get("ta_ps"))
+                    tot = _safe_float(d.get("tot_ps"))
+                    if ta is not None:
+                        tas.append(float(ta))
+                    if tot is not None:
+                        tots.append(float(tot))
+                except Exception:
+                    continue
+            return tas, tots
+
+        def _draw_hist(cv: tk.Canvas, values: list[float], *, title: str, bins: int = 60) -> None:
+            cv.delete("all")
+            w = int(cv.winfo_width() or 800)
+            h = int(cv.winfo_height() or 320)
+            pad_l, pad_r, pad_t, pad_b = 50, 14, 24, 34
+            cv.create_text(pad_l, 12, text=title, anchor="w", fill="#263238", font=("Segoe UI", 10, "bold"))
+            if not values:
+                cv.create_text(w // 2, h // 2, text="No TA/TOT samples available (needs decoded TA/TOT).", fill="#607d8b")
+                return
+            vmin = min(values)
+            vmax = max(values)
+            if not (vmax > vmin):
+                vmax = vmin + 1.0
+            bins = max(10, int(bins))
+            step = (vmax - vmin) / float(bins)
+            counts = [0] * bins
+            for v in values:
+                idx = int((v - vmin) / step)
+                if idx < 0:
+                    idx = 0
+                if idx >= bins:
+                    idx = bins - 1
+                counts[idx] += 1
+            cmax = max(counts) if counts else 1
+            # Axes
+            x0, y0 = pad_l, pad_t
+            x1, y1 = w - pad_r, h - pad_b
+            cv.create_line(x0, y1, x1, y1, fill="#90a4ae")
+            cv.create_line(x0, y0, x0, y1, fill="#90a4ae")
+            # Bars
+            bw = max(1.0, (x1 - x0) / float(bins))
+            for i, c in enumerate(counts):
+                if c <= 0:
+                    continue
+                x_left = x0 + i * bw
+                x_right = x_left + bw * 0.95
+                y_top = y1 - (float(c) / float(cmax)) * (y1 - y0)
+                cv.create_rectangle(x_left, y_top, x_right, y1, fill="#1976d2", outline="")
+            # Labels
+            cv.create_text(x0, y1 + 18, text=f"{vmin:.1f}", anchor="w", fill="#455a64", font=("Segoe UI", 9))
+            cv.create_text(x1, y1 + 18, text=f"{vmax:.1f}", anchor="e", fill="#455a64", font=("Segoe UI", 9))
+            cv.create_text(x0 - 6, y0, text=str(cmax), anchor="ne", fill="#455a64", font=("Segoe UI", 9))
+
+        def _draw_scatter(cv: tk.Canvas, xs: list[float], ys: list[float], *, title: str) -> None:
+            cv.delete("all")
+            w = int(cv.winfo_width() or 800)
+            h = int(cv.winfo_height() or 320)
+            pad_l, pad_r, pad_t, pad_b = 50, 14, 24, 34
+            cv.create_text(pad_l, 12, text=title, anchor="w", fill="#263238", font=("Segoe UI", 10, "bold"))
+            if not xs or not ys:
+                cv.create_text(w // 2, h // 2, text="No paired TA/TOT samples.", fill="#607d8b")
+                return
+            n = min(len(xs), len(ys))
+            pts = list(zip(xs[:n], ys[:n]))
+            # Subsample for speed
+            if len(pts) > 4000:
+                step = max(1, len(pts) // 4000)
+                pts = pts[::step]
+            xmin = min(p[0] for p in pts)
+            xmax = max(p[0] for p in pts)
+            ymin = min(p[1] for p in pts)
+            ymax = max(p[1] for p in pts)
+            if not (xmax > xmin):
+                xmax = xmin + 1.0
+            if not (ymax > ymin):
+                ymax = ymin + 1.0
+            x0, y0 = pad_l, pad_t
+            x1, y1 = w - pad_r, h - pad_b
+            cv.create_line(x0, y1, x1, y1, fill="#90a4ae")
+            cv.create_line(x0, y0, x0, y1, fill="#90a4ae")
+            for x, y in pts:
+                px = x0 + (float(x - xmin) / float(xmax - xmin)) * (x1 - x0)
+                py = y1 - (float(y - ymin) / float(ymax - ymin)) * (y1 - y0)
+                cv.create_oval(px - 1, py - 1, px + 1, py + 1, fill="#c62828", outline="")
+            cv.create_text(x0, y1 + 18, text=f"TA {xmin:.0f}..{xmax:.0f} ps", anchor="w", fill="#455a64", font=("Segoe UI", 9))
+            cv.create_text(x1, y1 + 18, text=f"TOT {ymin:.0f}..{ymax:.0f} ps", anchor="e", fill="#455a64", font=("Segoe UI", 9))
+
+        def _refresh() -> None:
+            tas, tots = _filter_samples()
+            # Pair for scatter
+            pairs_ta: list[float] = []
+            pairs_tot: list[float] = []
+            try:
+                want_mat = int(str(mat_var.get()).strip())
+            except Exception:
+                want_mat = 0
+            try:
+                want_ch = int(str(ch_var.get()).strip())
+            except Exception:
+                want_ch = 0
+            want_mat = max(0, min(15, want_mat))
+            want_ch = max(0, min(63, want_ch))
+            for d in samples:
+                try:
+                    if bool(use_filter.get()):
+                        if int(d.get("mat", -1) or -1) != want_mat:
+                            continue
+                        if int(d.get("channel", -1) or -1) != want_ch:
+                            continue
+                    ta = _safe_float(d.get("ta_ps"))
+                    tot = _safe_float(d.get("tot_ps"))
+                    if ta is not None and tot is not None:
+                        pairs_ta.append(float(ta))
+                        pairs_tot.append(float(tot))
+                except Exception:
+                    continue
+
+            # Std dev (TA only)
+            sigma = None
+            if len(tas) >= 2:
+                try:
+                    import statistics
+
+                    sigma = float(statistics.pstdev(tas))
+                except Exception:
+                    sigma = None
+            if bool(use_filter.get()):
+                stats_var.set(
+                    f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  "
+                    f"MAT={want_mat} CH={want_ch}  |  σ(TA)={sigma:.2f} ps" if sigma is not None else
+                    f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  MAT={want_mat} CH={want_ch}"
+                )
+            else:
+                stats_var.set(
+                    f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  σ(TA)={sigma:.2f} ps"
+                    if sigma is not None
+                    else f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}"
+                )
+
+            _draw_hist(cv_ta, tas, title="TA distribution (ps)")
+            _draw_hist(cv_tot, tots, title="TOT distribution (ps)")
+            _draw_scatter(cv_sc, pairs_ta, pairs_tot, title="TA vs TOT (ps)")
+
+        ttk.Button(ctrl, text="Analyze / refresh", command=_refresh).grid(row=0, column=6, sticky="w", padx=(12, 0))
+
+        # Auto-refresh on resize and on filter changes.
+        cv_ta.bind("<Configure>", lambda _e: _refresh())
+        cv_tot.bind("<Configure>", lambda _e: _refresh())
+        cv_sc.bind("<Configure>", lambda _e: _refresh())
+        use_filter.trace_add("write", lambda *_a: _refresh())
+        mat_var.trace_add("write", lambda *_a: _refresh())
+        ch_var.trace_add("write", lambda *_a: _refresh())
+
+        self.after(50, _refresh)
+
     def _fifo_ensure_i2c(self) -> None:
         # FIFO readout over I2C requires TOP readout interface set to i2c.
         try:
@@ -1951,21 +2239,24 @@ class Ignite64Gui(tk.Tk):
 
     def _gather_quad_stats(self, quad: str) -> dict[str, int]:
         """Per-quadrant counts (full MAT×pixel scan — runs in a worker thread)."""
-        analog_on = 0
+        pixon = 0
+        feon = 0
         for mat in range(16):
             # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
             if 4 <= int(mat) <= 7:
                 continue
             for ch in range(64):
                 if self.hw.readAnalogChannelON(quad, mattonella=mat, canale=ch):
-                    analog_on += 1
+                    pixon += 1
+                if self.hw.readAnalogFEON(quad, mattonella=mat, canale=ch):
+                    feon += 1
         tdc_mats = 0
         for mat in range(16):
             if 4 <= int(mat) <= 7:
                 continue
             if self.hw.readEnableTDC(quad, Mattonella=mat)["tdc_on"]:
                 tdc_mats += 1
-        return {"analog_on": analog_on, "digpix_on": analog_on, "tdc_mats": tdc_mats}
+        return {"pixon": pixon, "feon": feon, "tdc_mats": tdc_mats}
 
     def _format_quad_monitor_block(
         self,
@@ -1975,20 +2266,21 @@ class Ignite64Gui(tk.Tk):
         power_ok: Optional[bool],
         power_err: Optional[str],
     ) -> str:
-        """Testo per un quadrante: canali, PIX, TDC (Analog Power globale: solo bottone in home)."""
+        """Testo per un quadrante: FEON, PIXON, TDC (Analog Power globale: solo bottone in home)."""
         _ = (power_ok, power_err)  # API invariata; stato power non duplicato qui
         n_pix = 1024
         n_mat = 16
-        a = int(st.get("analog_on", 0))
-        d = int(st.get("digpix_on", 0))
+        # Legacy keys (pre split FEON vs PIXON); default 0 if absent.
+        p = int(st.get("pixon", st.get("digpix_on", 0)))
+        f = int(st.get("feon", st.get("analog_on", 0)))
         t = int(st.get("tdc_mats", 0))
-        pa = round(100.0 * a / n_pix, 1)
-        pd = round(100.0 * d / n_pix, 1)
+        pp = round(100.0 * p / n_pix, 1)
+        pf = round(100.0 * f / n_pix, 1)
         pt = round(100.0 * t / n_mat, 1)
         lines = [
-            f"{quad} — channels on: Analog CH ON = {a}/{n_pix}  ·  Dig PIX ON = {d}/{n_pix}",
-            f"Analog Channel ON: {a} / {n_pix} ({pa}%)",
-            f"Dig PIX ON: {d} / {n_pix} ({pd}%)",
+            f"{quad} — FEON (analog FE) = {f}/{n_pix}  ·  PIXON (digital out) = {p}/{n_pix}",
+            f"FEON bit7: {f} / {n_pix} ({pf}%)",
+            f"PIXON bit6: {p} / {n_pix} ({pp}%)",
             f"TDCon: {t} / {n_mat} MAT ({pt}%)",
             "Power consumption: — mW (per-quadrant: n/a in API)",
             "Analog ch. calibrated: — (n/a)",
@@ -1999,8 +2291,8 @@ class Ignite64Gui(tk.Tk):
         tag = "OFFLINE" if offline else "…"
         lines = [
             f"{quad} — channels on: {tag}",
-            f"Analog Channel ON: {tag}",
-            f"Dig PIX ON: {tag}",
+            f"FEON (analog FE): {tag}",
+            f"PIXON (digital out): {tag}",
             f"TDCon: {tag}",
             "Power consumption: — mW (per-quadrant: n/a in API)",
             "Analog ch. calibrated: — (n/a)",
@@ -2806,6 +3098,539 @@ class Ignite64Gui(tk.Tk):
 
         return frm
 
+    def _set_app_icon(self) -> None:
+        """
+        Best-effort application icon.
+        Uses a PNG from assets (same approach as classic `wm iconphoto` snippets).
+        """
+        try:
+            import sys
+
+            env = os.environ.get("IGNITE64_ICON_PNG", "").strip().strip('"').strip("'")
+            if env:
+                ip = Path(env)
+            else:
+                ip = Path(__file__).resolve().parent / "assets" / "ignite64_asic_icon.png"
+            if not ip.is_file():
+                return
+            ph = tk.PhotoImage(file=str(ip), master=self)
+            self._icon_photo_ref = ph
+            try:
+                # Same method you used: root.tk.call('wm', 'iconphoto', root._w, PhotoImage(...))
+                self.tk.call("wm", "iconphoto", self._w, ph)
+            except Exception:
+                try:
+                    self.iconphoto(True, ph)
+                except Exception:
+                    pass
+
+            # Windows taskbar: prefer a fixed .ico via iconbitmap (no generation here).
+            if sys.platform.startswith("win"):
+                try:
+                    import ctypes
+
+                    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ICBoost.IGNITE64.ASIC")  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    ico = Path(__file__).resolve().parent / "assets" / "ignite64_asic.ico"
+                    if ico.is_file():
+                        self.iconbitmap(default=str(ico))
+                except Exception:
+                    pass
+        except Exception:
+            # Never block GUI startup due to icon issues.
+            return
+
+    def _open_pulsing_window(self, quad: str) -> None:
+        """
+        AFE + TDC pulsing controls, plus FIFO monitor, roughly mirroring the C# GUI.
+        """
+        q = str(quad).strip().upper()
+        if q not in ("NW", "NE", "SW", "SE"):
+            q = str(self.quad_var.get()).strip().upper()
+        if q not in ("NW", "NE", "SW", "SE"):
+            q = "SW"
+
+        win = tk.Toplevel(self)
+        win.title(f"Pulsing — Q={q}")
+        win.transient(self)
+        win.resizable(True, True)
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=1)
+        root.columnconfigure(1, weight=1)
+
+        status_var = tk.StringVar(value="—")
+        ttk.Label(root, textvariable=status_var, wraplength=1100, font=("Segoe UI", 9)).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        # ----------------
+        # AFE pulsing
+        # ----------------
+        afe = ttk.Labelframe(root, text="AFE PULSING", padding=10)
+        afe.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        afe.columnconfigure(1, weight=1)
+
+        tp_period = tk.StringVar(value="0")
+        tp_width = tk.StringVar(value="0")
+        tp_rep = tk.StringVar(value="0")
+        tp_start = tk.BooleanVar(value=False)
+
+        afe_mat = tk.StringVar(value="0")
+        afe_ch = tk.StringVar(value="0")
+        afe_hitor = tk.BooleanVar(value=False)
+
+        def _afe_read() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+
+            def do() -> dict[str, object]:
+                self.hw.select_quadrant(q)
+                return dict(self.hw.readTopTPPulse())
+
+            out = self._with_hw(do, busy=f"Read TOP TP settings (Q={q})")
+            if not isinstance(out, dict):
+                return
+            try:
+                tp_period.set(str(int(out.get("tp_period", 0))))
+                tp_width.set(str(int(out.get("tp_width", 0))))
+                tp_rep.set(str(int(out.get("tp_repetition", 0))))
+                tp_start.set(bool(out.get("start_tp", False)))
+                status_var.set("TOP TP settings read OK.")
+            except Exception:
+                pass
+
+        def _afe_apply_tp() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+
+            def do() -> None:
+                self.hw.select_quadrant(q)
+                self.hw.TopTPPeriod(int(tp_period.get()))
+                self.hw.TopTPWidth(int(tp_width.get()))
+                self.hw.TopTPRepetition(int(tp_rep.get()))
+                self.hw.TopStartTPFlag(bool(tp_start.get()))
+
+            r = self._with_hw(do, busy=f"Apply TOP TP settings (Q={q})")
+            if r is None:
+                return
+            status_var.set("Applied TOP TP settings.")
+
+        def _afe_enable_atp() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+            try:
+                mid = int(str(afe_mat.get()).strip())
+                ch = int(str(afe_ch.get()).strip())
+            except Exception:
+                status_var.set("AFE select channel: invalid MAT/CH")
+                return
+
+            def do() -> None:
+                self.hw.ATPulse(q, mattonella=mid, canale=ch)
+
+            r = self._with_hw(do, busy=f"Enable ATP Pulse (Q={q} MAT={mid} CH={ch})")
+            if r is None:
+                return
+            status_var.set(f"ATP Pulse enabled for MAT {mid} CH {ch}.")
+
+        def _afe_apply_hitor() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+            try:
+                mid = int(str(afe_mat.get()).strip())
+            except Exception:
+                status_var.set("HiTor: invalid MAT")
+                return
+
+            def do() -> None:
+                self.hw.Hitor(q, mattonella=mid, valore=("HITOR" if bool(afe_hitor.get()) else "DAQTMR"))
+
+            r = self._with_hw(do, busy=f"Set HiTor={int(bool(afe_hitor.get()))} (Q={q} MAT={mid})")
+            if r is None:
+                return
+            status_var.set(f"HiTor {'ENABLED' if bool(afe_hitor.get()) else 'DISABLED'} on MAT {mid}.")
+
+        def _afe_reset_tmr() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+
+            def do() -> None:
+                self.hw.select_quadrant(q)
+                for mid in range(16):
+                    # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+                    if 4 <= int(mid) <= 7:
+                        continue
+                    try:
+                        self.hw.Hitor(q, mattonella=int(mid), valore="DAQTMR")
+                    except Exception:
+                        pass
+
+            r = self._with_hw(do, busy=f"Reset MAT test mode to TMR (Q={q})")
+            if r is None:
+                return
+            status_var.set("Reset done: MAT test mode set to TMR (best-effort; MAT 4–7 skipped).")
+
+        r0 = 0
+        ttk.Label(afe, text="TP period").grid(row=r0, column=0, sticky="w", pady=2)
+        ttk.Spinbox(afe, from_=0, to=15, width=8, textvariable=tp_period).grid(row=r0, column=1, sticky="w", pady=2)
+        r0 += 1
+        ttk.Label(afe, text="TP width").grid(row=r0, column=0, sticky="w", pady=2)
+        ttk.Spinbox(afe, from_=0, to=7, width=8, textvariable=tp_width).grid(row=r0, column=1, sticky="w", pady=2)
+        r0 += 1
+        ttk.Label(afe, text="TP repetition").grid(row=r0, column=0, sticky="w", pady=2)
+        ttk.Spinbox(afe, from_=0, to=63, width=8, textvariable=tp_rep).grid(row=r0, column=1, sticky="w", pady=2)
+        r0 += 1
+        ttk.Checkbutton(afe, text="StartTP flag", variable=tp_start).grid(
+            row=r0, column=0, columnspan=2, sticky="w", pady=(4, 2)
+        )
+        r0 += 1
+
+        bar = ttk.Frame(afe)
+        bar.grid(row=r0, column=0, columnspan=2, sticky="w", pady=(6, 10))
+        ttk.Button(bar, text="Read", command=_afe_read).pack(side="left")
+        ttk.Button(bar, text="Apply", command=_afe_apply_tp).pack(side="left", padx=(8, 0))
+
+        ttk.Separator(afe, orient="horizontal").grid(row=r0 + 1, column=0, columnspan=2, sticky="ew", pady=(8, 8))
+        r0 += 2
+
+        ttk.Label(afe, text="Select channel (MAT, CH)").grid(row=r0, column=0, sticky="w", pady=2)
+        row_sel = ttk.Frame(afe)
+        row_sel.grid(row=r0, column=1, sticky="w", pady=2)
+        ttk.Spinbox(row_sel, from_=0, to=15, width=5, textvariable=afe_mat).pack(side="left")
+        ttk.Label(row_sel, text="CH").pack(side="left", padx=(8, 4))
+        ttk.Spinbox(row_sel, from_=0, to=63, width=5, textvariable=afe_ch).pack(side="left")
+        r0 += 1
+
+        ttk.Button(afe, text="Enable ATP pulse for selected channel", command=_afe_enable_atp).grid(
+            row=r0, column=0, columnspan=2, sticky="w", pady=(4, 2)
+        )
+        r0 += 1
+        ttk.Checkbutton(
+            afe,
+            text="Enable HiTor on selected MAT (to route to SLVS HiTor)",
+            variable=afe_hitor,
+            command=_afe_apply_hitor,
+        ).grid(row=r0, column=0, columnspan=2, sticky="w", pady=(4, 2))
+        r0 += 1
+        ttk.Button(afe, text="Reset test mode to TMR (disable HiTor everywhere)", command=_afe_reset_tmr).grid(
+            row=r0, column=0, columnspan=2, sticky="w", pady=(6, 2)
+        )
+
+        # ----------------
+        # TDC pulsing
+        # ----------------
+        tdc = ttk.Labelframe(root, text="TDC PULSING", padding=10)
+        tdc.grid(row=0, column=1, sticky="nsew")
+        tdc.columnconfigure(1, weight=1)
+
+        pulse_src = tk.StringVar(value="0")
+        tp_ta = tk.StringVar(value="0")
+        tp_tot = tk.StringVar(value="0")
+        tdc_mat = tk.StringVar(value="0")
+        tdc_ch = tk.StringVar(value="0")
+
+        src_labels = ["NONE", "Internal Pulse", "NONE", "External Pulse"]
+
+        def _tdc_read() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+
+            def do() -> dict[str, int]:
+                self.hw.select_quadrant(q)
+                return dict(self.hw.readTopTDCPulsing())
+
+            out = self._with_hw(do, busy=f"Read TOP TDC pulsing (Q={q})")
+            if not isinstance(out, dict):
+                return
+            try:
+                pulse_src.set(str(int(out.get("pulsing_source", 0))))
+                tp_ta.set(str(int(out.get("test_point_ta", 0))))
+                tp_tot.set(str(int(out.get("test_point_tot", 0))))
+                status_var.set("TDC pulsing settings read OK.")
+            except Exception:
+                pass
+
+        def _tdc_apply() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+
+            def do() -> None:
+                self.hw.select_quadrant(q)
+                self.hw.TopTDCPulsingSource(int(pulse_src.get()))
+                self.hw.TopTDCTestPointTA(int(tp_ta.get()))
+                self.hw.TopTDCTestPointTOT(int(tp_tot.get()))
+
+            r = self._with_hw(do, busy=f"Apply TDC pulsing settings (Q={q})")
+            if r is None:
+                return
+            status_var.set("Applied TDC pulsing settings.")
+
+        def _tdc_enable_tdcpulse() -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+            try:
+                mid = int(str(tdc_mat.get()).strip())
+                ch = int(str(tdc_ch.get()).strip())
+            except Exception:
+                status_var.set("TDC select channel: invalid MAT/CH")
+                return
+
+            def do() -> None:
+                self.hw.TDCPulse(q, mattonella=mid, canale=ch)
+
+            r = self._with_hw(do, busy=f"Enable TDC Pulse mode (Q={q} MAT={mid} CH={ch})")
+            if r is None:
+                return
+            status_var.set(f"TDC Pulse mode enabled for MAT {mid} CH {ch}.")
+
+        def _tdc_test_pulse(times: int) -> None:
+            if self.offline:
+                status_var.set("OFFLINE")
+                return
+
+            def do() -> None:
+                self.hw.select_quadrant(q)
+                self.hw.TopTDCTestPulse(times=int(times))
+
+            r = self._with_hw(do, busy=f"TDC Test Pulse x{int(times)} (Q={q})")
+            if r is None:
+                return
+            status_var.set(f"TDC Test Pulse done x{int(times)}.")
+
+        rr = 0
+        ttk.Label(tdc, text="Pulsing source").grid(row=rr, column=0, sticky="w", pady=2)
+        src_cb = ttk.Combobox(tdc, state="readonly", width=22, values=[f"{i}: {s}" for i, s in enumerate(src_labels)])
+        src_cb.grid(row=rr, column=1, sticky="w", pady=2)
+
+        def _sync_src_to_var(_ev=None) -> None:
+            try:
+                pulse_src.set(str(int(src_cb.current())))
+            except Exception:
+                pass
+
+        def _sync_var_to_src(*_a: object) -> None:
+            try:
+                idx = int(str(pulse_src.get()).strip())
+            except Exception:
+                idx = 0
+            idx = max(0, min(3, idx))
+            try:
+                src_cb.current(idx)
+            except Exception:
+                pass
+
+        src_cb.bind("<<ComboboxSelected>>", _sync_src_to_var)
+        _sync_var_to_src()
+        rr += 1
+        ttk.Label(tdc, text="Test point TA").grid(row=rr, column=0, sticky="w", pady=2)
+        ttk.Spinbox(tdc, from_=0, to=15, width=8, textvariable=tp_ta).grid(row=rr, column=1, sticky="w", pady=2)
+        rr += 1
+        ttk.Label(tdc, text="Test point TOT").grid(row=rr, column=0, sticky="w", pady=2)
+        ttk.Spinbox(tdc, from_=0, to=31, width=8, textvariable=tp_tot).grid(row=rr, column=1, sticky="w", pady=2)
+        rr += 1
+
+        bar2 = ttk.Frame(tdc)
+        bar2.grid(row=rr, column=0, columnspan=2, sticky="w", pady=(6, 10))
+        ttk.Button(bar2, text="Read", command=_tdc_read).pack(side="left")
+        ttk.Button(bar2, text="Apply", command=_tdc_apply).pack(side="left", padx=(8, 0))
+        rr += 1
+
+        ttk.Separator(tdc, orient="horizontal").grid(row=rr, column=0, columnspan=2, sticky="ew", pady=(8, 8))
+        rr += 1
+
+        ttk.Label(tdc, text="Select channel (MAT, CH)").grid(row=rr, column=0, sticky="w", pady=2)
+        row_sel2 = ttk.Frame(tdc)
+        row_sel2.grid(row=rr, column=1, sticky="w", pady=2)
+        ttk.Spinbox(row_sel2, from_=0, to=15, width=5, textvariable=tdc_mat).pack(side="left")
+        ttk.Label(row_sel2, text="CH").pack(side="left", padx=(8, 4))
+        ttk.Spinbox(row_sel2, from_=0, to=63, width=5, textvariable=tdc_ch).pack(side="left")
+        rr += 1
+
+        ttk.Button(tdc, text="Enable TDC pulse for selected channel", command=_tdc_enable_tdcpulse).grid(
+            row=rr, column=0, columnspan=2, sticky="w", pady=(4, 2)
+        )
+        rr += 1
+
+        pulse_btns = ttk.Frame(tdc)
+        pulse_btns.grid(row=rr, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ttk.Label(pulse_btns, text="TDC Test Pulse").pack(side="left")
+        ttk.Button(pulse_btns, text="x1", command=lambda: _tdc_test_pulse(1)).pack(side="left", padx=(10, 0))
+        ttk.Button(pulse_btns, text="x10", command=lambda: _tdc_test_pulse(10)).pack(side="left", padx=(6, 0))
+        ttk.Button(pulse_btns, text="x100", command=lambda: _tdc_test_pulse(100)).pack(side="left", padx=(6, 0))
+
+        # -------------
+        # FIFO monitor (embedded)
+        # -------------
+        fifo = ttk.Labelframe(root, text="FIFO monitor (I2C)", padding=10)
+        fifo.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        fifo.columnconfigure(0, weight=1)
+
+        fifo_summary = tk.StringVar(value="—")
+        ttk.Label(fifo, textvariable=fifo_summary, wraplength=1100, font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
+
+        out = tk.Text(fifo, height=12, width=120, wrap="none", state="disabled")
+        yscroll = ttk.Scrollbar(fifo, orient="vertical", command=out.yview)
+        out.configure(yscrollcommand=yscroll.set)
+        out.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        yscroll.grid(row=1, column=1, sticky="ns", pady=(8, 0))
+
+        btns = ttk.Frame(fifo)
+        btns.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        auto_var = tk.BooleanVar(value=False)
+        auto_ms = tk.StringVar(value="250")
+        auto_after: list[Optional[str]] = [None]
+        decoded_samples: list[dict[str, object]] = []
+
+        def _fifo_clear() -> None:
+            auto_var.set(False)
+            try:
+                if auto_after[0] is not None:
+                    self.after_cancel(auto_after[0])
+            except Exception:
+                pass
+            auto_after[0] = None
+            out.configure(state="normal")
+            out.delete("1.0", "end")
+            out.configure(state="disabled")
+            fifo_summary.set("Cleared.")
+
+        def _fifo_read_one(decoded: bool) -> None:
+            if self.offline:
+                self._fifo_log(out, "OFFLINE")
+                fifo_summary.set("OFFLINE")
+                return
+
+            def do() -> int:
+                self._fifo_ensure_i2c()
+                self.hw.select_quadrant(q)
+                return int(self.hw.FifoReadSingle())
+
+            w = self._with_hw(do, busy=f"FIFO read (Q={q})")
+            if w is None:
+                return
+            w = int(w)
+            if w == 0:
+                self._fifo_log(out, "EMPTY")
+                fifo_summary.set("EMPTY")
+                return
+            try:
+                d0 = self._fifo_decode_word(w)
+                if int(d0.get("fifo_empty", 0)) == 1 and int(d0.get("fifo_cnt", 0)) == 0:
+                    self._fifo_log(out, "EMPTY(flag)")
+                    fifo_summary.set("EMPTY(flag)")
+                    return
+            except Exception:
+                pass
+            if decoded:
+                try:
+                    dd = self._fifo_decode_word_tdc(w, quad=q)
+                    decoded_samples.append(dd)
+                    mat = int(dd.get("mat", 0) or 0)
+                    ch = int(dd.get("channel", 0) or 0)
+                    ta = dd.get("ta_ps")
+                    tot = dd.get("tot_ps")
+                    msg = f"MAT={mat:02d} CH={ch:02d}"
+                    if isinstance(ta, float) and isinstance(tot, float):
+                        msg += f"  TA={ta:.2f}ps TOT={tot:.2f}ps"
+                    self._fifo_log(out, msg)
+                    fifo_summary.set("HIT(decoded)")
+                    return
+                except Exception:
+                    pass
+            self._fifo_log(out, f"0x{w:016X}")
+            fifo_summary.set("HIT(raw)")
+
+        def _fifo_drain(decoded: bool) -> None:
+            if self.offline:
+                return
+
+            def do() -> list[int]:
+                self._fifo_ensure_i2c()
+                self.hw.select_quadrant(q)
+                return list(self.hw.FifoDrain(max_words=128))
+
+            words = self._with_hw(do, busy=f"FIFO drain (Q={q})")
+            if not isinstance(words, list):
+                return
+            if not words:
+                self._fifo_log(out, "DRAIN: empty")
+                fifo_summary.set("Drain empty")
+                return
+            n = 0
+            for ww in words:
+                n += 1
+                if int(ww) == 0:
+                    continue
+                if decoded:
+                    try:
+                        dd = self._fifo_decode_word_tdc(int(ww), quad=q)
+                        decoded_samples.append(dd)
+                        mat = int(dd.get("mat", 0) or 0)
+                        ch = int(dd.get("channel", 0) or 0)
+                        ta = dd.get("ta_ps")
+                        tot = dd.get("tot_ps")
+                        msg = f"{n:03d}: MAT={mat:02d} CH={ch:02d}"
+                        if isinstance(ta, float) and isinstance(tot, float):
+                            msg += f"  TA={ta:.2f}ps TOT={tot:.2f}ps"
+                        self._fifo_log(out, msg)
+                        continue
+                    except Exception:
+                        pass
+                self._fifo_log(out, f"{n:03d}: 0x{int(ww):016X}")
+            fifo_summary.set(f"Drain: {len(words)} words")
+
+        def _auto_tick() -> None:
+            if not bool(auto_var.get()) or not win.winfo_exists():
+                auto_after[0] = None
+                return
+            _fifo_read_one(decoded=True)
+            try:
+                ms = int(str(auto_ms.get()).strip() or "250")
+            except Exception:
+                ms = 250
+            ms = max(20, min(5000, ms))
+            auto_after[0] = self.after(ms, _auto_tick)
+
+        def _toggle_auto() -> None:
+            if bool(auto_var.get()):
+                if auto_after[0] is None:
+                    _auto_tick()
+            else:
+                try:
+                    if auto_after[0] is not None:
+                        self.after_cancel(auto_after[0])
+                except Exception:
+                    pass
+                auto_after[0] = None
+
+        ttk.Button(btns, text="Read (raw)", command=lambda: _fifo_read_one(decoded=False)).pack(side="left")
+        ttk.Button(btns, text="Read (decoded)", command=lambda: _fifo_read_one(decoded=True)).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Drain (decoded)", command=lambda: _fifo_drain(decoded=True)).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Drain (raw)", command=lambda: _fifo_drain(decoded=False)).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Clear", command=_fifo_clear).pack(side="left", padx=(10, 0))
+        ttk.Button(btns, text="Analyze…", command=lambda qq=str(q): self._open_fifo_analyze_popup(qq, list(decoded_samples))).pack(
+            side="left", padx=(10, 0)
+        )
+        ttk.Checkbutton(btns, text="Auto", variable=auto_var, command=_toggle_auto).pack(side="left", padx=(10, 0))
+        ttk.Label(btns, text="ms").pack(side="left", padx=(6, 2))
+        ttk.Entry(btns, textvariable=auto_ms, width=6).pack(side="left")
+
+        # Prime with a read so the user sees current settings.
+        self.after(120, _afe_read)
+        self.after(160, _tdc_read)
+
     def _make_block_diagram(
         self,
         parent_: ttk.Frame,
@@ -3310,6 +4135,12 @@ class Ignite64Gui(tk.Tk):
         ttk.Checkbutton(all_bar, text="TDCON ALL", variable=q_td, command=lambda: apply_quad_all(tdcon=bool(q_td.get()))).pack(
             side="left", padx=(8, 0)
         )
+        ttk.Button(
+            iref_bar,
+            text="PULSE SECTION",
+            command=lambda q=str(quad).strip().upper(): self._open_pulsing_window(q),
+            width=16,
+        ).pack(side="left", padx=(12, 0), pady=(18, 0))
 
         grid = ttk.Frame(top)
         grid.pack(side="left", fill="both", expand=True)
@@ -3363,6 +4194,8 @@ class Ignite64Gui(tk.Tk):
             out.configure(state="disabled")
             fifo_summary_var.set("Log FIFO cancellato.")
 
+        decoded_samples: list[dict[str, object]] = []
+
         def read_one(decoded: bool) -> None:
             quad2 = self.quad_var.get()
 
@@ -3393,16 +4226,21 @@ class Ignite64Gui(tk.Tk):
                 self._fifo_log(out, f"0x{w:016X}")
                 fifo_summary_var.set(f"Ultimo read Q={quad2}: word raw 0x{w:016X}")
                 return
-            d = d0 if d0 else self._fifo_decode_word(w)
-            self._fifo_log(
-                out,
-                f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
-                f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
+            dd = self._fifo_decode_word_tdc(w, quad=str(quad2).strip().upper())
+            decoded_samples.append(dd)
+            mat = int(dd.get("mat", 0) or 0)
+            ch = int(dd.get("channel", 0) or 0)
+            msg = (
+                f"MAT={mat:2d}  CH={ch:2d}  "
+                f"cnt={int(dd.get('fifo_cnt', 0) or 0):3d} empty={int(dd.get('fifo_empty', 0) or 0)} "
+                f"full={int(dd.get('fifo_full', 0) or 0)} half={int(dd.get('fifo_halffull', 0) or 0)}"
             )
-            fifo_summary_var.set(
-                f"Ultimo Q={quad2}: MAT={d['mat']:02d} CH={d['channel']:02d}  "
-                f"cnt={d['fifo_cnt']} empty={d['fifo_empty']} hf={d['fifo_halffull']}"
-            )
+            ta = dd.get("ta_ps")
+            tot = dd.get("tot_ps")
+            if isinstance(ta, float) and isinstance(tot, float):
+                msg += f"  TA={ta:.2f}ps TOT={tot:.2f}ps"
+            self._fifo_log(out, msg)
+            fifo_summary_var.set(f"Ultimo Q={quad2}: MAT={mat:02d} CH={ch:02d} cnt={int(dd.get('fifo_cnt', 0) or 0)}")
 
         def drain(decoded: bool) -> None:
             quad2 = self.quad_var.get()
@@ -3438,16 +4276,29 @@ class Ignite64Gui(tk.Tk):
                 if not decoded:
                     self._fifo_log(out, f"0x{w:016X}")
                 else:
-                    d = self._fifo_decode_word(w)
-                    self._fifo_log(
-                        out,
-                        f"MAT={d['mat']:2d}  CH={d['channel']:2d}  "
-                        f"cnt={d['fifo_cnt']:3d} empty={d['fifo_empty']} full={d['fifo_full']} half={d['fifo_halffull']}",
+                    dd = self._fifo_decode_word_tdc(w, quad=str(quad2).strip().upper())
+                    decoded_samples.append(dd)
+                    mat = int(dd.get("mat", 0) or 0)
+                    ch = int(dd.get("channel", 0) or 0)
+                    msg = (
+                        f"MAT={mat:2d}  CH={ch:2d}  "
+                        f"cnt={int(dd.get('fifo_cnt', 0) or 0):3d} empty={int(dd.get('fifo_empty', 0) or 0)} "
+                        f"full={int(dd.get('fifo_full', 0) or 0)} half={int(dd.get('fifo_halffull', 0) or 0)}"
                     )
+                    ta = dd.get("ta_ps")
+                    tot = dd.get("tot_ps")
+                    if isinstance(ta, float) and isinstance(tot, float):
+                        msg += f"  TA={ta:.2f}ps TOT={tot:.2f}ps"
+                    self._fifo_log(out, msg)
 
         ttk.Button(btns, text="Read 1 (raw)", command=lambda: read_one(False)).pack(side="left", padx=3)
         ttk.Button(btns, text="Read 1 (decoded)", command=lambda: read_one(True)).pack(side="left", padx=3)
         ttk.Button(btns, text="Drain (decoded)", command=lambda: drain(True)).pack(side="left", padx=3)
+        ttk.Button(
+            btns,
+            text="Analyze…",
+            command=lambda q=str(self.quad_var.get()).strip().upper(): self._open_fifo_analyze_popup(q, list(decoded_samples)),
+        ).pack(side="left", padx=(10, 0))
         ttk.Button(btns, text="Clear", command=clear_out).pack(side="right", padx=3)
 
         ttk.Button(btns2, text="Drain (raw)", command=lambda: drain(False)).pack(side="left", padx=3)
@@ -3532,6 +4383,11 @@ class Ignite64Gui(tk.Tk):
             variable=td_all,
             command=lambda: self._set_block_all(block_id, tdcon=bool(td_all.get())),
         ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            toolbar,
+            text="PULSE SECTION",
+            command=lambda q=str(self.quad_var.get()).strip().upper(): self._open_pulsing_window(q),
+        ).pack(side="left", padx=(12, 0))
 
         ttk.Separator(frm).pack(fill="x", pady=8)
 
@@ -3595,6 +4451,8 @@ class Ignite64Gui(tk.Tk):
         out.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
 
+        decoded_samples: list[dict[str, object]] = []
+
         def read_one(decoded: bool) -> None:
             def do() -> int:
                 self._fifo_ensure_i2c()
@@ -3622,6 +4480,7 @@ class Ignite64Gui(tk.Tk):
                 summary.set(f"Q={q}: raw 0x{w:016X}")
                 return
             dd = self._fifo_decode_word_tdc(w, quad=q)
+            decoded_samples.append(dd)
             mat = int(dd.get("mat", 0) or 0)
             ch = int(dd.get("channel", 0) or 0)
             cal_mode = dd.get("cal_mode")
@@ -3671,6 +4530,7 @@ class Ignite64Gui(tk.Tk):
                     self._fifo_log(out, f"0x{w:016X}")
                 else:
                     dd = self._fifo_decode_word_tdc(w, quad=q)
+                    decoded_samples.append(dd)
                     mat = int(dd.get("mat", 0) or 0)
                     ch = int(dd.get("channel", 0) or 0)
                     cal_mode = dd.get("cal_mode")
@@ -3695,6 +4555,11 @@ class Ignite64Gui(tk.Tk):
         ttk.Button(btns, text="Read 1 (raw)", command=lambda: read_one(False)).pack(side="left", padx=3)
         ttk.Button(btns, text="Drain (decoded)", command=lambda: drain(True)).pack(side="left", padx=3)
         ttk.Button(btns, text="Drain (raw)", command=lambda: drain(False)).pack(side="left", padx=3)
+        ttk.Button(
+            btns,
+            text="Analyze…",
+            command=lambda qq=str(q).strip().upper(): self._open_fifo_analyze_popup(qq, list(decoded_samples)),
+        ).pack(side="left", padx=(10, 0))
 
         auto_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(btns2, text="Auto", variable=auto_var).pack(side="left", padx=(0, 6))

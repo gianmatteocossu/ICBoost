@@ -111,6 +111,8 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 | `readAnalogChannelON(quad, mattonella=, canale=) -> bool` | |
 | `EnableDigPix(quad, Mattonella=, Channel=, enable=)` | Stesso bit PIXON, naming “digitale”. |
 | `readEnableDigPix(quad, Mattonella=, Channel=) -> bool` | |
+| `readAnalogFEON(...) -> bool` / `setAnalogFEON(..., on=)` | FEON bit7 (front-end analogico); non modifica PIXON. |
+| `readAnalogENPOW(...)` | Stesso bit7 di FEON (alias di `readAnalogFEON`); **non** è PIXON. |
 | `EnableTDC(quad, Mattonella=, enable=, double_edge=?)` | TDC on/off per MAT. |
 | `readEnableTDC(quad, Mattonella=) -> dict` | `tdc_on`, `double_edge`. |
 | `readAnalogPower() -> bool` | Alimentazione analogica globale (IOext). |

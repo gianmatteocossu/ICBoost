@@ -637,6 +637,36 @@ class Ignite64(Ignite64LowLevel):
         d["channel"] = ch
         return d
 
+    def TDCPulse(self, quad: str, *, mattonella: int, canale: int) -> None:
+        """
+        Configure MAT test mode for CH41/CH42 as "TDC Pulse" and select the channel (0..63).
+        C# CH_MODE index: 2="TDC Pulse"
+        """
+        if canale < 0 or canale > 63:
+            raise ValueError("TDCPulse canale out of range (expected 0..63)")
+        self.select_quadrant(quad)
+        self._mat_set_ch_mode(mattonella, reg=MatRegs.CH_MODE_41, mode=2, selector=int(canale))
+        self._mat_set_ch_mode(mattonella, reg=MatRegs.CH_MODE_42, mode=2, selector=int(canale))
+
+    def readTDCPulse(self, quad: str, *, mattonella: int) -> dict[str, object]:
+        """
+        Read CH41/CH42 test mode configuration (MAT regs 65/66), with special handling
+        for TDCPulse (mode=2) and returning the selected channel if both match.
+        """
+        d = self.readHitor(quad, mattonella=mattonella)
+        ch = None
+        try:
+            m41 = int(d["CH41"]["mode"])  # type: ignore[index]
+            s41 = int(d["CH41"]["selector"])  # type: ignore[index]
+            m42 = int(d["CH42"]["mode"])  # type: ignore[index]
+            s42 = int(d["CH42"]["selector"])  # type: ignore[index]
+            if m41 == m42 == 2 and s41 == s42:
+                ch = s41
+        except Exception:
+            pass
+        d["channel"] = ch
+        return d
+
     def _mat_set_ch_mode(self, mat_id: int, *, reg: int, mode: int, selector: Optional[int]) -> None:
         if mode < 0 or mode > 3:
             raise ValueError("mode out of range (expected 0..3)")
@@ -1139,10 +1169,12 @@ class Ignite64(Ignite64LowLevel):
         return {"tdc_on": (b & 0x40) != 0, "double_edge": (b & 0x80) != 0}
 
     def AnalogChannelON(self, quad: str, *, mattonella: int, canale: int) -> None:
+        """Set PIXON (bit6): digital pixel output path — C# name legacy; not FEON (use ``setAnalogFEON``)."""
         self.select_quadrant(quad)
         self._pix_set_onoff(mattonella, canale, on=True)
 
     def AnalogChannelOFF(self, quad: str, *, mattonella: int, canale: int) -> None:
+        """Clear PIXON (bit6); does not change FEON (bit7)."""
         self.select_quadrant(quad)
         self._pix_set_onoff(mattonella, canale, on=False)
 
@@ -1173,14 +1205,15 @@ class Ignite64(Ignite64LowLevel):
 
     def readAnalogENPOW(self, quad: str, *, mattonella: int, canale: int) -> bool:
         """
-        Lettura dello stato ON/OFF del canale/pixel (bit PIXON).
+        Read FE_ON / ENPOW (bit7) — same as ``readAnalogFEON``.
+        Historically this wrapper mistakenly delegated to PIXON (bit6); fixed to match the name.
         """
-        self.select_quadrant(quad)
-        return self.readAnalogChannelON(quad, mattonella=mattonella, canale=canale)
+        return self.readAnalogFEON(quad, mattonella=mattonella, canale=canale)
 
     def readAnalogFEON(self, quad: str, *, mattonella: int, canale: int) -> bool:
         """
-        Read FE_ON / ENPOW state for a pixel (bit7 of per-pixel register).
+        Read FE_ON / ENPOW state for a pixel (bit7 of per-pixel register; analog front-end path).
+        For digital pixel output (PIXON, bit6) use ``readAnalogChannelON`` / ``readEnableDigPix``.
         """
         self.select_quadrant(quad)
         if canale < 0 or canale > 63:
@@ -1197,6 +1230,7 @@ class Ignite64(Ignite64LowLevel):
         self._pix_set_feon(int(mattonella), int(canale), on=bool(on))
 
     def readAnalogChannelON(self, quad: str, *, mattonella: int, canale: int) -> bool:
+        """True if PIXON (bit6) is set — not FEON (bit7); see ``readAnalogFEON``."""
         self.select_quadrant(quad)
         if canale < 0 or canale > 63:
             raise ValueError(f"pix_id out of range: {canale} (expected 0..63)")
@@ -1479,6 +1513,125 @@ class Ignite64(Ignite64LowLevel):
         """
         b = self.i2c_read_byte(self.addr.top_addr, 11)
         return {"start": ((b >> 6) & 1) == 1, "repetition": b & 0x3F, "eos": ((b >> 7) & 1) == 1}
+
+    def TopTPPeriod(self, valore: int) -> None:
+        """
+        Set TP period (TOP reg10 bits3..0).
+        C# mapping: TOP[10] = 16*TP_WIDTH + TP_PERIOD
+        """
+        if valore < 0 or valore > 15:
+            raise ValueError("TP period out of range (expected 0..15)")
+        reg = 10
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = _update_masked_byte(old, mask=0x0F, value=int(valore) & 0x0F)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def TopTPWidth(self, valore: int) -> None:
+        """
+        Set TP width (TOP reg10 bits6..4, 0..7).
+        C# mapping: TOP[10] = 16*TP_WIDTH + TP_PERIOD
+        """
+        if valore < 0 or valore > 7:
+            raise ValueError("TP width out of range (expected 0..7)")
+        reg = 10
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = _update_masked_byte(old, mask=0x70, value=(int(valore) & 0x07) << 4)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def TopTPRepetition(self, valore: int) -> None:
+        """
+        Set TP repetition (TOP reg11 bits5..0, 0..63) without forcing StartTP.
+        """
+        if valore < 0 or valore > 63:
+            raise ValueError("TP repetition out of range (expected 0..63)")
+        reg = 11
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = (old & 0xC0) | (int(valore) & 0x3F)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def TopStartTPFlag(self, start: bool) -> None:
+        """
+        Set StartTP flag (TOP reg11 bit6) without changing repetition (bits5..0) or EOS (bit7).
+        """
+        reg = 11
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = (old & 0xBF) | (0x40 if bool(start) else 0x00)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def readTopTPPulse(self) -> dict[str, int | bool]:
+        """
+        Read TP pulse related TOP regs:
+          - reg10: TP period (bits3..0) and width (bits6..4)
+          - reg11: repetition (bits5..0), start (bit6), eos (bit7)
+        """
+        b10 = self.i2c_read_byte(self.addr.top_addr, 10)
+        b11 = self.i2c_read_byte(self.addr.top_addr, 11)
+        return {
+            "tp_period": int(b10 & 0x0F),
+            "tp_width": int((b10 >> 4) & 0x07),
+            "tp_repetition": int(b11 & 0x3F),
+            "start_tp": ((b11 >> 6) & 1) == 1,
+            "eos": ((b11 >> 7) & 1) == 1,
+        }
+
+    def TopTDCPulsingSource(self, source: int) -> None:
+        """
+        Set pulsing source (TOP reg6 bits5..4, 0..3).
+        C# mapping: TOP[6] = 16*SEL_PULSE_SRC + POINT_TA
+        """
+        if source < 0 or source > 3:
+            raise ValueError("pulsing source out of range (expected 0..3)")
+        reg = 6
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = _update_masked_byte(old, mask=0x30, value=(int(source) & 0x03) << 4)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def TopTDCTestPointTA(self, point: int) -> None:
+        """
+        Set TA test point (TOP reg6 bits3..0, 0..15).
+        """
+        if point < 0 or point > 15:
+            raise ValueError("TA test point out of range (expected 0..15)")
+        reg = 6
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = _update_masked_byte(old, mask=0x0F, value=int(point) & 0x0F)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def TopTDCTestPointTOT(self, point: int) -> None:
+        """
+        Set TOT test point (TOP reg7 bits4..0, 0..31).
+        """
+        if point < 0 or point > 31:
+            raise ValueError("TOT test point out of range (expected 0..31)")
+        reg = 7
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = _update_masked_byte(old, mask=0x1F, value=int(point) & 0x1F)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def readTopTDCPulsing(self) -> dict[str, int]:
+        """
+        Read TDC pulsing settings:
+          - TOP[6]: pulsing source (bits5..4) and TA test point (bits3..0)
+          - TOP[7]: TOT test point (bits4..0)
+        """
+        b6 = self.i2c_read_byte(self.addr.top_addr, 6)
+        b7 = self.i2c_read_byte(self.addr.top_addr, 7)
+        return {"pulsing_source": int((b6 >> 4) & 0x03), "test_point_ta": int(b6 & 0x0F), "test_point_tot": int(b7 & 0x1F)}
+
+    def TopTDCTestPulse(self, *, times: int = 1) -> None:
+        """
+        Trigger TOP TDC test pulse command by writing TOP reg32, mirroring C# `TDC_PULSE_contMenuStripClick`.
+        Note: preserves bits7..4 from current value and sets bit1.
+        """
+        n = int(times)
+        if n < 1:
+            return
+        reg = 32
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        cmd = (int(old) & 0xF0) | 0x02
+        for _i in range(n):
+            self.i2c_write_byte(self.addr.top_addr, reg, cmd)
+            time.sleep(0.001)
 
     # ---------------------------
     # SI5340 clock configuration
