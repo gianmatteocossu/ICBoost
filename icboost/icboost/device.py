@@ -526,25 +526,95 @@ class Ignite64LowLevel:
 
     # ---- I2C primitives (guarded like in C#) ----
 
+    def _i2c_pace(self) -> None:
+        """
+        Sleep a bit after each I2C transaction to avoid hammering the vendor USB driver.
+
+        Env (milliseconds):
+          - IGNITE64_I2C_PACE_MS=1.0   (default 1ms if unset)
+          - set to 0 to disable pacing
+        """
+        try:
+            import os
+            import time
+
+            if not hasattr(self, "_i2c_pace_ms_cache"):
+                raw = os.environ.get("IGNITE64_I2C_PACE_MS", "").strip()
+                pace_ms = 1.0 if raw == "" else float(raw)
+                self._i2c_pace_ms_cache = max(0.0, float(pace_ms))
+            ms = float(getattr(self, "_i2c_pace_ms_cache", 0.0))
+            if ms > 0:
+                time.sleep(ms / 1000.0)
+        except Exception:
+            return
+
     def i2c_read_byte(self, dev_addr: int, reg: int) -> int:
-        with self._i2c_lock:
-            out = c_byte(0)
-            rc = int(self.tcp.I2C_ReadByte(c_byte(dev_addr), c_byte(reg), byref(out)))
-            if rc != 0:
-                raise Ignite64TransportError(f"I2C_ReadByte(dev=0x{dev_addr:02X}, reg=0x{reg:02X}) -> {rc}")
-            return int(out.value) & 0xFF
+        import os
+        import time
+
+        retries = int(os.environ.get("IGNITE64_I2C_RETRIES", "").strip() or "6")
+        backoff_s = float(os.environ.get("IGNITE64_I2C_BACKOFF_S", "").strip() or "0.001")
+        # IMPORTANT:
+        # Do NOT call I2C_BusRecovery automatically. On some driver builds this can itself trigger
+        # blocking WDU_Transfer popups and destabilize the session.
+        do_recovery = False
+        last_rc: int | None = None
+        last_err: Exception | None = None
+        for i in range(max(1, retries)):
+            try:
+                with self._i2c_lock:
+                    out = c_byte(0)
+                    rc = int(self.tcp.I2C_ReadByte(c_byte(dev_addr), c_byte(reg), byref(out)))
+                last_rc = rc
+                if rc == 0:
+                    self._i2c_pace()
+                    return int(out.value) & 0xFF
+            except Exception as e:
+                last_err = e
+            # no automatic bus recovery here (see note above)
+            time.sleep(max(0.0, backoff_s) * float(i + 1))
+        if last_err is not None:
+            raise Ignite64TransportError(
+                f"I2C_ReadByte(dev=0x{dev_addr:02X}, reg=0x{reg:02X}) failed after {max(1,retries)} attempts: {last_err}"
+            ) from last_err
+        raise Ignite64TransportError(
+            f"I2C_ReadByte(dev=0x{dev_addr:02X}, reg=0x{reg:02X}) -> {last_rc}"
+        )
 
     def i2c_write_byte(self, dev_addr: int, reg: int, value: int) -> None:
-        with self._i2c_lock:
-            rc = int(self.tcp.I2C_WriteByte(c_byte(dev_addr), c_byte(reg), c_byte(value & 0xFF)))
-            if rc != 0:
-                raise Ignite64TransportError(
-                    f"I2C_WriteByte(dev=0x{dev_addr:02X}, reg=0x{reg:02X}, value=0x{value & 0xFF:02X}) -> {rc}"
-                )
+        import os
+        import time
+
+        retries = int(os.environ.get("IGNITE64_I2C_RETRIES", "").strip() or "6")
+        backoff_s = float(os.environ.get("IGNITE64_I2C_BACKOFF_S", "").strip() or "0.001")
+        do_recovery = False
+        last_rc: int | None = None
+        last_err: Exception | None = None
+        for i in range(max(1, retries)):
+            try:
+                with self._i2c_lock:
+                    rc = int(self.tcp.I2C_WriteByte(c_byte(dev_addr), c_byte(reg), c_byte(value & 0xFF)))
+                last_rc = rc
+                if rc == 0:
+                    self._i2c_pace()
+                    return
+            except Exception as e:
+                last_err = e
+            # no automatic bus recovery here (see note in i2c_read_byte)
+            time.sleep(max(0.0, backoff_s) * float(i + 1))
+        if last_err is not None:
+            raise Ignite64TransportError(
+                f"I2C_WriteByte(dev=0x{dev_addr:02X}, reg=0x{reg:02X}, value=0x{value & 0xFF:02X}) failed after {max(1,retries)} attempts: {last_err}"
+            ) from last_err
+        raise Ignite64TransportError(
+            f"I2C_WriteByte(dev=0x{dev_addr:02X}, reg=0x{reg:02X}, value=0x{value & 0xFF:02X}) -> {last_rc}"
+        )
 
     def i2c_send_byte(self, dev_addr: int, value: int) -> int:
         with self._i2c_lock:
-            return int(self.tcp.I2C_SendByte(c_byte(dev_addr), c_byte(value & 0xFF)))
+            rc = int(self.tcp.I2C_SendByte(c_byte(dev_addr), c_byte(value & 0xFF)))
+        self._i2c_pace()
+        return rc
 
     def i2c_receive_byte(self, dev_addr: int) -> int:
         """
@@ -555,7 +625,9 @@ class Ignite64LowLevel:
             rc = int(self.tcp.I2C_ReceiveByte(c_byte(dev_addr), byref(out)))
             if rc != 0:
                 raise Ignite64TransportError(f"I2C_ReceiveByte(dev=0x{dev_addr:02X}) -> {rc}")
-            return int(out.value) & 0xFF
+            v = int(out.value) & 0xFF
+        self._i2c_pace()
+        return v
 
     def i2c_write_raw(self, dev_addr: int, data: "Union[bytes, bytearray, List[int]]", *, send_stop: int = 1) -> None:
         """
@@ -574,6 +646,7 @@ class Ignite64LowLevel:
         buf = (c_byte * n)(*data)
         with self._i2c_lock:
             rc = int(self.tcp.I2C_Write(c_byte(dev_addr), c_ushort(n), buf, c_ushort(int(send_stop))))
+        self._i2c_pace()
         if rc != 0:
             raise Ignite64TransportError(f"I2C_Write(dev=0x{dev_addr:02X}, n={n}, send_stop={send_stop}) -> {rc}")
 
@@ -586,6 +659,7 @@ class Ignite64LowLevel:
         buf = (c_byte * n)()
         with self._i2c_lock:
             rc = int(self.tcp.I2C_Read(c_byte(dev_addr), c_ushort(int(n)), buf, c_ushort(int(send_stop))))
+        self._i2c_pace()
         if rc != 0:
             raise Ignite64TransportError(f"I2C_Read(dev=0x{dev_addr:02X}, n={n}, send_stop={send_stop}) -> {rc}")
         return bytes((int(b) & 0xFF) for b in buf)
@@ -604,6 +678,7 @@ class Ignite64LowLevel:
         buf = (c_byte * n)(*data)
         with self._i2c_lock:
             rc = int(self.tcp.I2C_WriteArray(c_byte(dev_addr), c_byte(start_reg), c_ushort(n), buf))
+        self._i2c_pace()
         if rc != 0:
             raise Ignite64TransportError(
                 f"I2C_WriteArray(dev=0x{dev_addr:02X}, start=0x{start_reg:02X}, n={n}) -> {rc}"
@@ -618,6 +693,7 @@ class Ignite64LowLevel:
         buf = (c_byte * n)()
         with self._i2c_lock:
             rc = int(self.tcp.I2C_ReadArray(c_byte(dev_addr), c_byte(start_reg), c_ushort(n), buf))
+        self._i2c_pace()
         if rc != 0:
             raise Ignite64TransportError(
                 f"I2C_ReadArray(dev=0x{dev_addr:02X}, start=0x{start_reg:02X}, n={n}) -> {rc}"
@@ -631,11 +707,46 @@ class Ignite64LowLevel:
         """
         if n <= 0:
             return 0, b""
+
+        import os
+        import time
+
+        retries = int(os.environ.get("IGNITE64_I2C_RETRIES", "").strip() or "6")
+        backoff_s = float(os.environ.get("IGNITE64_I2C_BACKOFF_S", "").strip() or "0.001")
+        do_recovery = False
+
         buf = (c_byte * n)()
-        with self._i2c_lock:
-            rc = int(self.tcp.I2C_ReadArray(c_byte(dev_addr), c_byte(start_reg), c_ushort(n), buf))
+        last_rc: int | None = None
+        last_err: Exception | None = None
+        for i in range(max(1, retries)):
+            try:
+                with self._i2c_lock:
+                    rc = int(self.tcp.I2C_ReadArray(c_byte(dev_addr), c_byte(start_reg), c_ushort(n), buf))
+                self._i2c_pace()
+                last_rc = rc
+
+                # For FIFO reads rc==3 means "empty": return immediately, no retries.
+                if rc == 3:
+                    return 3, b""
+                if rc == 0:
+                    data = bytes((int(b) & 0xFF) for b in buf)
+                    return 0, data
+
+                # rc==1 is the common transient driver failure (WDU_Transfer). Retry.
+            except Exception as e:
+                last_err = e
+
+            # no automatic bus recovery here (see note in i2c_read_byte)
+            time.sleep(max(0.0, backoff_s) * float(i + 1))
+
+        if last_err is not None:
+            raise Ignite64TransportError(
+                f"I2C_ReadArray(dev=0x{dev_addr:02X}, start=0x{start_reg:02X}, n={n}) failed after {max(1,retries)} attempts: {last_err}"
+            ) from last_err
+
+        # If we only saw non-zero rc values (not 0/3), return the last one with best-effort bytes.
         data = bytes((int(b) & 0xFF) for b in buf)
-        return rc, data
+        return int(last_rc or 0), data
 
     # ---- helpers for MAT addressing ----
 

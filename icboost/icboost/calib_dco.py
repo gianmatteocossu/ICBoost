@@ -519,6 +519,7 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
     Returns the in-memory calibration matrices; optionally writes a summary file if `output_path` is set.
     """
     p = progress or (lambda _m: None)
+    p(f"start params={params!r}")
     if params.quadrant_combo_index == 5:
         raise ValueError("CalibDCO: quadrante BROADCAST non supportato (nel C# il loop è vuoto).")
 
@@ -591,25 +592,70 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
                     pix_min = 0
                     pix_max = 63
 
+                # Progress knobs (keep terminal readable)
+                import os as _os
+                try:
+                    pix_every = int(_os.environ.get("IGNITE64_CALIB_PIX_PROGRESS_EVERY", "").strip() or "4")
+                except Exception:
+                    pix_every = 4
+                if pix_every < 1:
+                    pix_every = 1
+                ok_dco0 = 0
+                ok_dco1 = 0
+
                 for i_pix in range(pix_min, pix_max + 1):
-                    # Ignite32_Mat_PIX_conf_noUI(matID, pixID, FE_ON=null, PIXON=ON)
-                    _mat_pixel_conf_no_ui(hw, i_m, i_pix, fe_on=None, pix_on=ON)
-                    _mat_command_no_ui(hw, i_m, 0, daq_res=False, g48_63=True, g32_47=True, g16_31=True, g00_15=True)
-                    read_until_empty(
-                        hw,
-                        loaded,
-                        cur_quad,
-                        dco0_adjctrl,
-                        _read_dco_conf(hw, i_m, 1, i_pix),
-                        new_cal=False,
-                        threshold=params.fifo_threshold,
-                    )
+                    if i_pix == pix_min or i_pix == pix_max or ((i_pix - pix_min) % pix_every == 0):
+                        p(f"MAT {i_m}: PIX {i_pix}/{pix_max}")
+                    # Retry the whole DCO0-measurement step for this pixel instead of skipping
+                    # on the first transient rc=1 from the USB/I2C DLL.
+                    try:
+                        pix_retries = int(_os.environ.get("IGNITE64_CALIB_PIXEL_RETRIES", "").strip() or "12")
+                    except Exception:
+                        pix_retries = 12
+                    try:
+                        pix_backoff_s = float(_os.environ.get("IGNITE64_CALIB_PIXEL_BACKOFF_S", "").strip() or "0.02")
+                    except Exception:
+                        pix_backoff_s = 0.02
+                    pix_retries = max(1, int(pix_retries))
+                    pix_backoff_s = max(0.0, float(pix_backoff_s))
+
+                    last_pix_err: Optional[Exception] = None
+                    for attempt in range(pix_retries):
+                        try:
+                            # Ignite32_Mat_PIX_conf_noUI(matID, pixID, FE_ON=null, PIXON=ON)
+                            _mat_pixel_conf_no_ui(hw, i_m, i_pix, fe_on=None, pix_on=ON)
+                            _mat_command_no_ui(
+                                hw, i_m, 0, daq_res=False, g48_63=True, g32_47=True, g16_31=True, g00_15=True
+                            )
+                            read_until_empty(
+                                hw,
+                                loaded,
+                                cur_quad,
+                                dco0_adjctrl,
+                                _read_dco_conf(hw, i_m, 1, i_pix),
+                                new_cal=False,
+                                threshold=params.fifo_threshold,
+                            )
+                            last_pix_err = None
+                            break
+                        except Exception as e:
+                            last_pix_err = e
+                            if attempt < pix_retries - 1:
+                                time.sleep(pix_backoff_s * float(attempt + 1))
+                                continue
+                    if last_pix_err is not None:
+                        p(
+                            f"WARN: MAT {i_m} PIX {i_pix} skipped after {pix_retries} attempts (I2C/FIFO error): "
+                            f"{last_pix_err}"
+                        )
+                        continue
 
                     dco0_list = loaded.get_by_key(i_m, i_pix, 1, 0)
                     if not dco0_list:
                         p(f"AVVISO: nessun dato CAL DCO0 MAT {i_m} PIX {i_pix}")
                         continue
                     dco0 = _latest(dco0_list)
+                    ok_dco0 += 1
 
                     looped_once = False
                     adj_ctrl = dco0_adjctrl + min(5, 64 - dco0_adjctrl)
@@ -622,25 +668,57 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
                             adj_ctrl += 1
                             break
 
-                        _mat_pixel_conf_no_ui(
-                            hw, i_m, i_pix, fe_on=False, pix_on=True, adj=adj_ctrl // 16, ctrl=adj_ctrl % 16
-                        )
-                        _mat_command_no_ui(hw, i_m, 1, daq_res=False, g48_63=True, g32_47=True, g16_31=True, g00_15=True)
-                        read_until_empty(
-                            hw,
-                            loaded,
-                            cur_quad,
-                            _read_dco_conf(hw, i_m, 0, i_pix),
-                            adj_ctrl,
-                            new_cal=True,
-                            threshold=params.fifo_threshold,
-                        )
+                        # Retry this AdjCtrl step a few times; only then move on.
+                        try:
+                            adj_retries = int(_os.environ.get("IGNITE64_CALIB_ADJ_RETRIES", "").strip() or "8")
+                        except Exception:
+                            adj_retries = 8
+                        try:
+                            adj_backoff_s = float(_os.environ.get("IGNITE64_CALIB_ADJ_BACKOFF_S", "").strip() or "0.02")
+                        except Exception:
+                            adj_backoff_s = 0.02
+                        adj_retries = max(1, int(adj_retries))
+                        adj_backoff_s = max(0.0, float(adj_backoff_s))
+
+                        last_adj_err: Optional[Exception] = None
+                        for attempt in range(adj_retries):
+                            try:
+                                _mat_pixel_conf_no_ui(
+                                    hw, i_m, i_pix, fe_on=False, pix_on=True, adj=adj_ctrl // 16, ctrl=adj_ctrl % 16
+                                )
+                                _mat_command_no_ui(
+                                    hw, i_m, 1, daq_res=False, g48_63=True, g32_47=True, g16_31=True, g00_15=True
+                                )
+                                read_until_empty(
+                                    hw,
+                                    loaded,
+                                    cur_quad,
+                                    _read_dco_conf(hw, i_m, 0, i_pix),
+                                    adj_ctrl,
+                                    new_cal=True,
+                                    threshold=params.fifo_threshold,
+                                )
+                                last_adj_err = None
+                                break
+                            except Exception as e:
+                                last_adj_err = e
+                                if attempt < adj_retries - 1:
+                                    time.sleep(adj_backoff_s * float(attempt + 1))
+                                    continue
+                        if last_adj_err is not None:
+                            p(
+                                f"WARN: MAT {i_m} PIX {i_pix} AdjCtrl {adj_ctrl} failed after {adj_retries} attempts: "
+                                f"{last_adj_err}"
+                            )
+                            adj_ctrl += 1
+                            continue
 
                         by_dco1 = loaded.get_by_key(i_m, i_pix, 1, 1)
                         if not by_dco1:
                             adj_ctrl += 1
                             continue
                         data_entry = _latest(by_dco1)
+                        ok_dco1 += 1
                         d0t = dco0.dco0_t_ps
                         d1t = data_entry.dco1_t_ps
                         if d0t is None or d1t is None:
@@ -662,15 +740,31 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
                             loaded.dco_conf_pairs[cur_quad][data_entry.mat][data_entry.pix][1] = int(
                                 data_entry.adjctrl_dco1 or 0
                             )
-                            _mat_pixel_conf_no_ui(
-                                hw,
-                                i_m,
-                                i_pix,
-                                fe_on=None,
-                                pix_on=False,
-                                adj=adj_ctrl // 16,
-                                ctrl=adj_ctrl % 16,
-                            )
+                            # This I2C write can fail transiently (rc=1). Do not abort the whole
+                            # calibration: retry a few times, then keep going.
+                            last_off_err: Optional[Exception] = None
+                            for attempt in range(adj_retries):
+                                try:
+                                    _mat_pixel_conf_no_ui(
+                                        hw,
+                                        i_m,
+                                        i_pix,
+                                        fe_on=None,
+                                        pix_on=False,
+                                        adj=adj_ctrl // 16,
+                                        ctrl=adj_ctrl % 16,
+                                    )
+                                    last_off_err = None
+                                    break
+                                except Exception as e:
+                                    last_off_err = e
+                                    if attempt < adj_retries - 1:
+                                        time.sleep(adj_backoff_s * float(attempt + 1))
+                            if last_off_err is not None:
+                                p(
+                                    f"WARN: MAT {i_m} PIX {i_pix} failed to apply pix_on=OFF at AdjCtrl {adj_ctrl} "
+                                    f"after {adj_retries} attempts: {last_off_err}"
+                                )
                             loaded.cal_matrix[cur_quad][dco0.mat][dco0.pix][0] = float(d0t)
                             loaded.cal_matrix[cur_quad][data_entry.mat][data_entry.pix][1] = float(d1t)
                             is_done = True
@@ -681,25 +775,53 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
                             is_done = True
                             looped_once = False
                             adj_reserve = loaded.dco_conf_pairs[cur_quad][data_entry.mat][data_entry.pix][1]
-                            _mat_pixel_conf_no_ui(
-                                hw,
-                                i_m,
-                                i_pix,
-                                fe_on=None,
-                                pix_on=True,
-                                adj=adj_reserve // 16,
-                                ctrl=adj_reserve % 16,
-                            )
-                            _mat_command_no_ui(hw, i_m, 1, daq_res=False, g48_63=True, g32_47=True, g16_31=True, g00_15=True)
-                            read_until_empty(
-                                hw,
-                                loaded,
-                                cur_quad,
-                                _read_dco_conf(hw, i_m, 0, i_pix),
-                                adj_reserve,
-                                new_cal=True,
-                                threshold=params.fifo_threshold,
-                            )
+                            try:
+                                last_reserve_err: Optional[Exception] = None
+                                for attempt in range(adj_retries):
+                                    try:
+                                        _mat_pixel_conf_no_ui(
+                                            hw,
+                                            i_m,
+                                            i_pix,
+                                            fe_on=None,
+                                            pix_on=True,
+                                            adj=adj_reserve // 16,
+                                            ctrl=adj_reserve % 16,
+                                        )
+                                        _mat_command_no_ui(
+                                            hw,
+                                            i_m,
+                                            1,
+                                            daq_res=False,
+                                            g48_63=True,
+                                            g32_47=True,
+                                            g16_31=True,
+                                            g00_15=True,
+                                        )
+                                        read_until_empty(
+                                            hw,
+                                            loaded,
+                                            cur_quad,
+                                            _read_dco_conf(hw, i_m, 0, i_pix),
+                                            adj_reserve,
+                                            new_cal=True,
+                                            threshold=params.fifo_threshold,
+                                        )
+                                        last_reserve_err = None
+                                        break
+                                    except Exception as e:
+                                        last_reserve_err = e
+                                        if attempt < adj_retries - 1:
+                                            time.sleep(adj_backoff_s * float(attempt + 1))
+                                if last_reserve_err is not None:
+                                    p(
+                                        f"WARN: MAT {i_m} PIX {i_pix} AdjCtrl reserve-step failed after {adj_retries} attempts: "
+                                        f"{last_reserve_err}"
+                                    )
+                                    break
+                            except Exception as e:
+                                p(f"WARN: MAT {i_m} PIX {i_pix} reserve-step exception: {e}")
+                                break
                             by_dco1b = loaded.get_by_key(i_m, i_pix, 1, 1)
                             if not by_dco1b:
                                 break
@@ -711,19 +833,33 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
                             loaded.resolution_matrix[cur_quad][dco0.mat][dco0.pix] = float(d0t) - float(d1t)
                             loaded.cal_matrix[cur_quad][dco0.mat][dco0.pix][0] = float(d0t)
                             loaded.cal_matrix[cur_quad][data_entry.mat][data_entry.pix][1] = float(d1t)
-                            _mat_pixel_conf_no_ui(
-                                hw,
-                                i_m,
-                                i_pix,
-                                fe_on=None,
-                                pix_on=False,
-                                adj=adj_reserve // 16,
-                                ctrl=adj_reserve % 16,
-                            )
+                            last_off2_err: Optional[Exception] = None
+                            for attempt in range(adj_retries):
+                                try:
+                                    _mat_pixel_conf_no_ui(
+                                        hw,
+                                        i_m,
+                                        i_pix,
+                                        fe_on=None,
+                                        pix_on=False,
+                                        adj=adj_reserve // 16,
+                                        ctrl=adj_reserve % 16,
+                                    )
+                                    last_off2_err = None
+                                    break
+                                except Exception as e:
+                                    last_off2_err = e
+                                    if attempt < adj_retries - 1:
+                                        time.sleep(adj_backoff_s * float(attempt + 1))
+                            if last_off2_err is not None:
+                                p(
+                                    f"WARN: MAT {i_m} PIX {i_pix} failed to apply pix_on=OFF (reserve) after {adj_retries} attempts: "
+                                    f"{last_off2_err}"
+                                )
                         adj_ctrl += 1
 
                 _mat_cal_conf_no_ui(hw, i_m, cal_mode=False, cal_time=cal_time)
-                p(f"Fine MAT {i_m}")
+                p(f"Fine MAT {i_m} (pixels_with_dco0={ok_dco0}/{(pix_max - pix_min + 1)}; dco1_meas={ok_dco1})")
                 i_m += 1
 
         if params.output_path:

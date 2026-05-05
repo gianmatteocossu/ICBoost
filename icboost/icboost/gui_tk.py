@@ -1268,6 +1268,16 @@ class Ignite64Gui(tk.Tk):
             )
             if not path:
                 return
+            # Touch the output file early so the user immediately sees something created,
+            # and so failures before the final write are visible.
+            try:
+                from datetime import datetime
+
+                with open(path, "w", encoding="utf-8") as _f:
+                    _f.write(f"# Calib DCO started: {datetime.now().isoformat(timespec='seconds')}\n")
+            except Exception as _e:
+                err_var.set(f"Cannot write output file: {_e}")
+                return
             try:
                 params = CalibDCOParams(
                     quadrant_combo_index=qi,
@@ -1292,11 +1302,24 @@ class Ignite64Gui(tk.Tk):
 
             def work() -> None:
                 def prog(msg: str) -> None:
+                    # Always mirror progress to stderr too (terminal survives status overwrites).
+                    try:
+                        import sys
+                        sys.stderr.write(f"[CalibDCO] {msg}\n")
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
                     self.after(0, lambda m=msg: self._set_status(m))
 
                 try:
+                    prog(f"start output={path}")
                     loaded = self.hw.run_calib_dco(params, progress=prog)
                 except Exception as e:
+                    try:
+                        import traceback, sys
+                        traceback.print_exc(file=sys.stderr)
+                    except Exception:
+                        pass
                     self.after(0, lambda e=e: self._set_status(f"Calib DCO error: {e}"))
                     return
                 # Cache per-pixel results for the FTDAC popup.
@@ -4358,9 +4381,60 @@ class Ignite64Gui(tk.Tk):
             text="FIFO…",
             command=lambda q=str(self.quad_var.get()).strip().upper(): self._open_fifo_popup(q),
         ).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="Calibrate channels…", command=lambda bid=block_id: self._calib_block_threshold(bid)).pack(
-            side="left", padx=(6, 0)
-        )
+        ttk.Button(
+            toolbar,
+            text="Calibrate channels…",
+            command=lambda bid=block_id: self._calib_block_threshold(bid),
+        ).pack(side="left", padx=(6, 0))
+
+        # --- FTDAC ALL (set all 64 channels to same code) ---
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Label(toolbar, text="FTDAC ALL").pack(side="left")
+        ftdac_all_sb = tk.Spinbox(toolbar, from_=0, to=15, width=4)
+        ftdac_all_sb.delete(0, "end")
+        ftdac_all_sb.insert(0, "15")
+        ftdac_all_sb.pack(side="left", padx=(6, 6))
+
+        def _apply_ftdac_all() -> None:
+            q = str(self.quad_var.get()).strip().upper()
+            try:
+                code = int(str(ftdac_all_sb.get()).strip())
+            except Exception:
+                self._set_status("FTDAC ALL: inserire un numero 0..15")
+                return
+            if code < 0 or code > 15:
+                self._set_status("FTDAC ALL: inserire un numero 0..15")
+                return
+
+            targets = [int(x) for x in mats]
+
+            def do() -> None:
+                for mid in targets:
+                    # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+                    if 4 <= int(mid) <= 7:
+                        continue
+                    for ch in range(64):
+                        self.hw.AnalogChannelFineTune(q, block=0, mattonella=int(mid), canale=int(ch), valore=int(code))
+
+            r = self._with_hw(do, busy=f"FTDAC ALL={code} (Q={q} block={int(block_id)})")
+            if r is None and not self.offline:
+                return
+
+            # Update snapshot cache optimistically.
+            try:
+                qc = self._mat_snapshot_cache.setdefault(q, {})
+                for mid in targets:
+                    ent = qc.setdefault(int(mid), {})
+                    ent["ftdac"] = [int(code)] * 64
+            except Exception:
+                pass
+            try:
+                self._refresh_block(int(block_id))
+            except Exception:
+                pass
+            self._set_status(f"FTDAC ALL set to {code} (block {int(block_id)})")
+
+        ttk.Button(toolbar, text="Apply", command=_apply_ftdac_all).pack(side="left")
         # ALL toggles for this block
         fe_all = tk.BooleanVar(value=False)
         px_all = tk.BooleanVar(value=False)
@@ -4618,12 +4692,14 @@ class Ignite64Gui(tk.Tk):
 
         step_code = tk.StringVar(value="1")
         min_code = tk.StringVar(value="0")
-        settle_ms = tk.StringVar(value="5")
-        poll_ms = tk.StringVar(value="50")
-        polls_per_step = tk.StringVar(value="10")
+        settle_ms = tk.StringVar(value="50")
+        poll_ms = tk.StringVar(value="5")
+        polls_per_step = tk.StringVar(value="5")
         start_code = tk.StringVar(value="15")
         start_mat = tk.StringVar(value=str(int(mats[0]) if mats else 0))
         start_ch = tk.StringVar(value="0")
+        end_mat = tk.StringVar(value=str(int(mats[-1]) if mats else 0))
+        end_ch = tk.StringVar(value="63")
 
         def _row(r: int, label: str, var: tk.StringVar) -> None:
             ttk.Label(params, text=label, width=18).grid(row=r, column=0, sticky="w")
@@ -4637,6 +4713,8 @@ class Ignite64Gui(tk.Tk):
         _row(5, "Polls/step:", polls_per_step)
         _row(6, "Start MAT:", start_mat)
         _row(7, "Start CH:", start_ch)
+        _row(8, "End MAT:", end_mat)
+        _row(9, "End CH:", end_ch)
 
         status = tk.StringVar(value="—")
         ttk.Label(root, textvariable=status, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
@@ -4816,7 +4894,30 @@ class Ignite64Gui(tk.Tk):
                 except Exception:
                     sch = 0
                 sch = max(0, min(63, int(sch)))
-                log(f"RESUME from MAT {int(sm)} CH {int(sch)}")
+                try:
+                    em = int(str(end_mat.get()).strip() or str(int(mats[-1]) if mats else sm))
+                except Exception:
+                    em = int(mats[-1]) if mats else int(sm)
+                try:
+                    ech = int(str(end_ch.get()).strip() or "63")
+                except Exception:
+                    ech = 63
+                ech = max(0, min(63, int(ech)))
+
+                # Normalize range in terms of iteration order across the block mats list.
+                mats_ord = [int(x) for x in mats]
+                if int(sm) not in mats_ord:
+                    sm = mats_ord[0] if mats_ord else int(sm)
+                if int(em) not in mats_ord:
+                    em = mats_ord[-1] if mats_ord else int(em)
+                i_sm = mats_ord.index(int(sm)) if mats_ord else 0
+                i_em = mats_ord.index(int(em)) if mats_ord else 0
+                if i_em < i_sm:
+                    i_sm, i_em = i_em, i_sm
+                    sm, em = em, sm
+                    sch, ech = ech, sch
+
+                log(f"RANGE MAT {int(sm)} CH {int(sch)} -> MAT {int(em)} CH {int(ech)} (block mats={mats_ord})")
                 resume_started = False
                 self.after(0, lambda: status.set("Calibration: starting channels…"))
                 log(f"BLOCK {block_id} mats={mats}")
@@ -4843,8 +4944,10 @@ class Ignite64Gui(tk.Tk):
                         except Exception:
                             pass
 
-                # Calibrate channels sequentially.
-                for mid in mats:
+                # Calibrate channels sequentially (within selected range).
+                for mi, mid in enumerate(mats):
+                    if mi < i_sm or mi > i_em:
+                        continue
                     if stop_evt.is_set():
                         return
                     if 4 <= int(mid) <= 7:
@@ -4852,6 +4955,11 @@ class Ignite64Gui(tk.Tk):
                     for ch in range(64):
                         if stop_evt.is_set():
                             return
+                        # Apply start/end bounds for first/last MAT in range.
+                        if mi == i_sm and int(ch) < int(sch):
+                            continue
+                        if mi == i_em and int(ch) > int(ech):
+                            break
                         if not resume_started:
                             if int(mid) < int(sm):
                                 continue
@@ -4954,6 +5062,60 @@ class Ignite64Gui(tk.Tk):
 
     def _build_mat_mini(self, parent: ttk.Frame, mat_id: int, *, title: str) -> ttk.Frame:
         frm = ttk.Labelframe(parent, text=title, padding=4)
+        quad = str(self.quad_var.get()).strip().upper()
+
+        # Per-MAT ALL toggles (only for direct-addressable MATs)
+        ctl = ttk.Frame(frm)
+        ctl.pack(fill="x", pady=(0, 4))
+        fe_var = tk.BooleanVar(value=False)
+        px_var = tk.BooleanVar(value=False)
+        td_var = tk.BooleanVar(value=False)
+
+        # Initialize FE/PIX from cache if available (best-effort)
+        try:
+            qc = self._mat_snapshot_cache.get(quad, {})
+            ent = qc.get(int(mat_id), {}) if isinstance(qc, dict) else {}
+            if isinstance(ent, dict):
+                po = ent.get("pix_on")
+                fo = ent.get("fe_on")
+                if isinstance(po, list) and len(po) == 64:
+                    px_var.set(all(bool(x) for x in po))
+                if isinstance(fo, list) and len(fo) == 64:
+                    fe_var.set(all(bool(x) for x in fo))
+        except Exception:
+            pass
+
+        disabled = (4 <= int(mat_id) <= 7)
+        if disabled:
+            ttk.Label(ctl, text="MAT 4–7: direct I2C disabled", foreground="#777777").pack(side="left")
+        else:
+            ttk.Checkbutton(
+                ctl,
+                text="FEON ALL",
+                variable=fe_var,
+                command=lambda mid=int(mat_id): self._set_mat_all(mid, feon=bool(fe_var.get())),
+            ).pack(side="left", padx=(0, 6))
+            ttk.Checkbutton(
+                ctl,
+                text="PIXON ALL",
+                variable=px_var,
+                command=lambda mid=int(mat_id): self._set_mat_all(mid, pixon=bool(px_var.get())),
+            ).pack(side="left", padx=(0, 6))
+            ttk.Checkbutton(
+                ctl,
+                text="TDCON",
+                variable=td_var,
+                command=lambda mid=int(mat_id): self._set_mat_all(mid, tdcon=bool(td_var.get())),
+            ).pack(side="left", padx=(0, 6))
+
+        # Keep references so we can sync checkbox state to the actual chip state on refresh.
+        try:
+            if not hasattr(self, "_mat_all_vars"):
+                self._mat_all_vars = {}  # type: ignore[attr-defined]
+            self._mat_all_vars[(str(quad).strip().upper(), int(mat_id))] = {"fe": fe_var, "px": px_var, "td": td_var}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         cv = tk.Canvas(frm, highlightthickness=0, bd=0, bg="#fafafa")
         cv.pack(fill="both", expand=True)
 
@@ -5436,9 +5598,9 @@ class Ignite64Gui(tk.Tk):
         start_code = tk.StringVar(value="")
         step_code = tk.StringVar(value="1")
         min_code = tk.StringVar(value="0")
-        settle_ms = tk.StringVar(value="5")
-        poll_ms = tk.StringVar(value="50")
-        polls_per_step = tk.StringVar(value="10")
+        settle_ms = tk.StringVar(value="50")
+        poll_ms = tk.StringVar(value="5")
+        polls_per_step = tk.StringVar(value="5")
 
         def _row(r: int, label: str, var: tk.StringVar) -> None:
             ttk.Label(params, text=label, width=18).grid(row=r, column=0, sticky="w")
@@ -5686,6 +5848,33 @@ class Ignite64Gui(tk.Tk):
         except Exception:
             pass
 
+    def _set_mat_all(self, mat_id: int, *, feon: Optional[bool] = None, pixon: Optional[bool] = None, tdcon: Optional[bool] = None) -> None:
+        quad = self.quad_var.get()
+
+        def do() -> None:
+            self.hw.select_quadrant(quad)
+            mid = int(mat_id)
+            if 4 <= int(mid) <= 7:
+                return
+            if tdcon is not None:
+                self.hw.EnableTDC(quad, Mattonella=int(mid), enable=bool(tdcon))
+            if feon is not None or pixon is not None:
+                for ch in range(64):
+                    if feon is not None:
+                        self.hw.setAnalogFEON(quad, mattonella=int(mid), canale=int(ch), on=bool(feon))
+                    if pixon is not None:
+                        if bool(pixon):
+                            self.hw.AnalogChannelON(quad, mattonella=int(mid), canale=int(ch))
+                        else:
+                            self.hw.AnalogChannelOFF(quad, mattonella=int(mid), canale=int(ch))
+
+        self._with_hw(do, busy=f"Apply ALL (MAT={int(mat_id)} quad={str(quad).strip().upper()})")
+        # Always refresh from HW/cache so checkboxes reflect real chip state (even on errors).
+        try:
+            self._refresh_mat_mini(int(mat_id))
+        except Exception:
+            pass
+
     def _iref_sync_for_quad(self, quad: str) -> None:
         q = str(quad).strip().upper()
         if q not in self._iref_last_mv_by_quad:
@@ -5824,6 +6013,32 @@ class Ignite64Gui(tk.Tk):
             and len(ftdac) == 64
         ):
             return
+
+        # Sync per-MAT ALL toggle checkboxes to the *actual* chip/cache state.
+        try:
+            vars_map = getattr(self, "_mat_all_vars", {}).get((str(qkey), int(mat_id)), None)
+            if isinstance(vars_map, dict):
+                # FEON
+                if isinstance(fe_on, list) and len(fe_on) == 64 and "fe" in vars_map:
+                    try:
+                        vars_map["fe"].set(all(bool(x) for x in fe_on))
+                    except Exception:
+                        pass
+                # PIXON
+                if isinstance(pix_on, list) and len(pix_on) == 64 and "px" in vars_map:
+                    try:
+                        vars_map["px"].set(all(bool(x) for x in pix_on))
+                    except Exception:
+                        pass
+                # TDCON (single bit per MAT) – best effort readback for direct-accessible MATs
+                if 0 <= int(mat_id) <= 15 and not (4 <= int(mat_id) <= 7) and "td" in vars_map:
+                    try:
+                        td = bool(self.hw.readEnableTDC(qkey, Mattonella=int(mat_id)).get("tdc_on", False))
+                        vars_map["td"].set(bool(td))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         canvas = self._block_pix_canvas.get(mat_id)
         rects = self._block_pix_cells.get(mat_id)
         if canvas is None or not rects or len(rects) != 64:

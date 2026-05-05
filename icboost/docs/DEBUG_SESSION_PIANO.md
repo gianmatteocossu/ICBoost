@@ -47,6 +47,14 @@ Checklist veloce per verifica funzionalità **con hardware**. Incrociare con `do
 | 5.1 | `CalibrateFTDAC` **un canale** prima di MAT intera | Completa o errore esplicito |
 | 5.2 | `CalibDCO` | Trattare come **sperimentale**; log FIFO e tempi |
 
+### 5.2.1 Note operative `CalibDCO` (retry e timing)
+
+- **Retry alto livello**: la calibrazione DCO ripete automaticamente i passi per‑pixel e per‑`AdjCtrl` in caso di errori I2C transitori (es. `rc=1` su `I2C_ReadByte`).  
+  - Default interni: `PIXEL_RETRIES=12`, `PIXEL_BACKOFF_S=0.02`, `ADJ_RETRIES=8`, `ADJ_BACKOFF_S=0.02`.
+  - Sovrascrivibili via env (`IGNITE64_CALIB_PIXEL_RETRIES`, `IGNITE64_CALIB_PIXEL_BACKOFF_S`, `IGNITE64_CALIB_ADJ_RETRIES`, `IGNITE64_CALIB_ADJ_BACKOFF_S`) solo per debug fine.
+- **Comportamento atteso**: singoli pixel problematici vengono ritentati più volte; se falliscono ancora, vengono marcati come non calibrati ma **non fermano** la calibrazione della MAT/quadrante.
+- **Suggerimento**: in presenza di molti retry, verificare la stabilità del link USB e l’assenza di altre applicazioni che usano la stessa DLL/porta.
+
 ## 6. Macro GUI elenco
 
 | # | Macro | Nota |

@@ -179,6 +179,18 @@ Legenda: *quad* = stringa quadrante. Parametri tra parentesi sono keyword salvo 
 | `run_calib_dco(...)` | Wrapper alto livello. |
 | `CalibDCO(...)` | Classe / helper (dettagli in `calib_dco.py`). |
 
+La calibrazione DCO in `calib_dco.py` è stata resa più **robusta a errori I2C transitori** del bridge USB (`rc=1` / `WDU_Transfer`):
+
+- Le operazioni per‑pixel e per‑`AdjCtrl` includono retry ad alto livello con backoff esponenziale leggero.
+- I default interni corrispondono all’assetto raccomandato in laboratorio:
+  - `IGNITE64_CALIB_PIXEL_RETRIES` default **12**
+  - `IGNITE64_CALIB_PIXEL_BACKOFF_S` default **0.02**
+  - `IGNITE64_CALIB_ADJ_RETRIES` default **8**
+  - `IGNITE64_CALIB_ADJ_BACKOFF_S` default **0.02**
+- I valori possono ancora essere sovrascritti via variabili d’ambiente se necessario per debug; in assenza di env vengono usati i default sopra.
+
+In caso di errore persistente su un pixel, la calibrazione **ritenta più volte lo stesso pixel** e solo alla fine lo marca come non calibrato, senza interrompere l’intera scansione della MAT.
+
 ### 5.11 Avvio `start_config`
 
 `start_config(quadrant, ...)` esegue sequenza: USB, IOext, clock SI5340, scrittura TOP+MAT da file in `ConfigurationFiles/`. Parametri opzionali: percorsi file, registri IOext, tempo stabilizzazione mux. Vedere docstring in `api.py`.
