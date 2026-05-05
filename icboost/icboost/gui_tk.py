@@ -2525,6 +2525,12 @@ class Ignite64Gui(tk.Tk):
             self._top_slvs_var = tk.StringVar(value="hitor")
         if getattr(self, "_top_tp_rep_var", None) is None:
             self._top_tp_rep_var = tk.StringVar(value="1")
+        if getattr(self, "_top_si_clk_in_var", None) is None:
+            # Human-friendly subset of the C# options: Crystal vs SMA.
+            self._top_si_clk_in_var = tk.StringVar(value="Crystal")
+        if getattr(self, "_top_si5340_cfg_var", None) is None:
+            # Default matches bring-up default in run_gui()/api.init_hw().
+            self._top_si5340_cfg_var = tk.StringVar(value="Si5340-RevD_Crystal-Registers_bis.txt")
         if getattr(self, "_top_status_var", None) is None:
             self._top_status_var = tk.StringVar(value="—")
 
@@ -2711,6 +2717,28 @@ class Ignite64Gui(tk.Tk):
         g = ttk.Frame(lf)
         g.pack(fill="x")
 
+        from pathlib import Path
+        import os
+
+        cfg_base = Path(__file__).resolve().parents[1] / "ConfigurationFiles"
+
+        def _resolve_cfg_path(name_or_path: str) -> Path:
+            s = str(name_or_path or "").strip()
+            if not s:
+                return cfg_base / "Si5340-RevD_Crystal-Registers_bis.txt"
+            p = Path(s)
+            return p if (p.is_absolute() or len(p.parts) > 1) else (cfg_base / p)
+
+        def _si5340_candidates() -> list[str]:
+            try:
+                cand = sorted(
+                    [p.name for p in cfg_base.glob("Si5340-*.txt")],
+                    key=lambda x: x.lower(),
+                )
+                return cand if cand else [self._top_si5340_cfg_var.get()]
+            except Exception:
+                return [self._top_si5340_cfg_var.get()]
+
         r = 0
         ttk.Label(g, text="Quadrant (write / readback)").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
         ttk.Combobox(
@@ -2792,6 +2820,79 @@ class Ignite64Gui(tk.Tk):
                 self._set_status(str(e))
 
         ttk.Button(g, text="Start TP / pulse", command=pulse_tp).grid(row=r, column=2, padx=8, pady=2)
+        r += 1
+
+        # --- IOext: SI_CLK input source select (Crystal vs SMA) ---
+        ttk.Label(g, text="SI_CLK IN sel").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
+        si_in_cb = ttk.Combobox(
+            g,
+            textvariable=self._top_si_clk_in_var,
+            values=("Crystal", "SMA"),
+            width=10,
+            state="readonly",
+        )
+        si_in_cb.grid(row=r, column=1, sticky="w", pady=2)
+
+        def apply_si_clk_in() -> None:
+            if self.offline:
+                return
+            try:
+                self._before_top_write()
+                sel = str(self._top_si_clk_in_var.get()).strip().lower()
+                # C# mapping: 0=SMA, 3=Crystal
+                raw = 0 if ("sma" in sel) else 3
+                self.hw.setSIClkInSel(int(raw))
+                self._set_status(f"SI_CLK IN sel → {self._top_si_clk_in_var.get()} ({self._sel_top_apply_quad()})")
+                refresh_top_ro()
+            except Exception as e:
+                self._set_status(str(e))
+
+        ttk.Button(g, text="Apply", command=apply_si_clk_in).grid(row=r, column=2, padx=8, pady=2)
+        r += 1
+
+        # --- SI5340: load a clock configuration file ---
+        ttk.Label(g, text="SI5340 cfg").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
+        si_cfg_cb = ttk.Combobox(
+            g,
+            textvariable=self._top_si5340_cfg_var,
+            values=_si5340_candidates(),
+            width=42,
+        )
+        si_cfg_cb.grid(row=r, column=1, columnspan=2, sticky="w", pady=2)
+
+        def browse_si_cfg() -> None:
+            try:
+                p = filedialog.askopenfilename(
+                    title="Select SI5340 configuration file",
+                    initialdir=str(cfg_base),
+                    filetypes=[("SI5340 config", "*.txt"), ("All files", "*.*")],
+                )
+                if p:
+                    try:
+                        # Prefer showing just the filename if it's inside ConfigurationFiles/
+                        pp = Path(p)
+                        if cfg_base in pp.parents:
+                            self._top_si5340_cfg_var.set(pp.name)
+                        else:
+                            self._top_si5340_cfg_var.set(str(pp))
+                    except Exception:
+                        self._top_si5340_cfg_var.set(str(p))
+            except Exception as e:
+                self._set_status(str(e))
+
+        def apply_si_cfg() -> None:
+            if self.offline:
+                return
+            try:
+                self._before_top_write()
+                p = _resolve_cfg_path(self._top_si5340_cfg_var.get())
+                self.hw.loadClockSetting(str(p))
+                self._set_status(f"SI5340 configured from {p.name} ({self._sel_top_apply_quad()})")
+            except Exception as e:
+                self._set_status(str(e))
+
+        ttk.Button(g, text="Browse…", command=browse_si_cfg).grid(row=r, column=3, padx=8, pady=2)
+        ttk.Button(g, text="Apply clock cfg", command=apply_si_cfg).grid(row=r, column=4, padx=8, pady=2)
 
         def refresh_top_ro() -> None:
             if self.offline:
@@ -2806,6 +2907,11 @@ class Ignite64Gui(tk.Tk):
                 self._top_slvs_var.set(self._norm_top_slvs(self.hw.readTopSLVS()))
                 tp = self.hw.readStartTP()
                 self._top_tp_rep_var.set(str(int(tp["repetition"])))
+                try:
+                    raw = int(self.hw.readSIClkInSel())
+                    self._top_si_clk_in_var.set("SMA" if raw == 0 else ("Crystal" if raw == 3 else f"idx{raw}"))
+                except Exception:
+                    pass
                 self._top_status_var.set(
                     f"TOP [{qq}]: readout={self._top_ro_var.get()}  SLVS={self._top_slvs_var.get()}  "
                     f"StartTP={tp['start']} repet={tp['repetition']}  "

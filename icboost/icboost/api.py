@@ -1332,6 +1332,46 @@ class Ignite64(Ignite64LowLevel):
             new = b | (1 << 6)
         self.i2c_write_byte(dev, 10, new & 0xFF)
 
+    def readSIClkInSel(self) -> int:
+        """
+        Read SI_CLK input source selection from IOext reg 10 bits[5:4].
+
+        Matches C# `IOext_gpio_refresh()`:
+          SiClkInSrc_comboBox.SelectedIndex = (num >> 4) & 3;
+
+        Return value is the raw 2-bit index (0..3). In the C# UI the mapping is:
+          0=SMA, 1=KRIA, 2=NONE, 3=Crystal
+        """
+        dev = int(self.addr.ioext_addr) & 0xFF
+        try:
+            b = int(self.i2c_read_byte(dev, 10)) & 0xFF
+        except Exception:
+            self.autodetect_ioext_address()
+            dev = int(self.addr.ioext_addr) & 0xFF
+            b = int(self.i2c_read_byte(dev, 10)) & 0xFF
+        return (int(b) >> 4) & 0x03
+
+    def setSIClkInSel(self, sel: int) -> None:
+        """
+        Set SI_CLK input source selection in IOext reg 10 bits[5:4], preserving other bits.
+
+        `sel` is the raw 2-bit index (0..3), same convention as C#:
+          0=SMA, 1=KRIA, 2=NONE, 3=Crystal
+        """
+        s = int(sel)
+        if s < 0 or s > 3:
+            raise ValueError(f"sel out of range: {sel} (expected 0..3)")
+        dev = int(self.addr.ioext_addr) & 0xFF
+        try:
+            b = int(self.i2c_read_byte(dev, 10)) & 0xFF
+        except Exception:
+            self.autodetect_ioext_address()
+            dev = int(self.addr.ioext_addr) & 0xFF
+            b = int(self.i2c_read_byte(dev, 10)) & 0xFF
+        # clear bits[5:4] then set from s
+        new = (b & ~0x30) | ((s & 0x03) << 4)
+        self.i2c_write_byte(dev, 10, int(new) & 0xFF)
+
     # ---------------------------
     # Internal DACs (per MAT)
     # ---------------------------

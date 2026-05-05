@@ -206,6 +206,7 @@ Panoramica funzioni aggiunte rispetto alla sola navigazione menu (dettaglio vari
 - **Check Calibration**: campionamento burst + statistiche canali rumorosi; azione **Turn OFF offending channels** (PIX/FE/TDC come da implementazione corrente) quando serve ripulire dopo calibrazione.
 - **Reconnect USB**: recovery best-effort dopo errori tipo `WDU_Transfer` (bus recovery + `init_hw()` senza riscrittura TOP/MAT).
 - **Quadrant “ALL” / broadcast**: per MAT 4–7 e operazioni su intero quadrante, preferire i percorsi GUI che usano broadcast invece di I2C diretto per MAT.
+- **Clock IO board (SI5340 / SI_CLK)**: nella pagina **TOP** puoi selezionare la sorgente **SI_CLK IN** (Crystal vs SMA) e applicare un file di configurazione **SI5340** scegliendolo da `ConfigurationFiles/` (o via browse).
 
 ---
 
