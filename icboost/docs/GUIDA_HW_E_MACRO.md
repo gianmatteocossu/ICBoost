@@ -202,10 +202,12 @@ In caso di errore persistente su un pixel, la calibrazione **ritenta più volte 
 Panoramica funzioni aggiunte rispetto alla sola navigazione menu (dettaglio variabili d’ambiente in **[INSTALLAZIONE_WINDOWS.md](INSTALLAZIONE_WINDOWS.md)**):
 
 - **FIFO**: pannello con decodifica parola, drain, letture robuste durante calibrazione; attenzione a hit “stale” — le routine GUI filtrano spesso per MAT/canale atteso.
+- **Analyze FIFO (istogrammi)**: dal pannello FIFO puoi aprire **Analyze…** per visualizzare distribuzioni **TA** / **TOT** e scatter **TA vs TOT** con filtro **MAT/CH**. Nota: la finestra Analyze usa lo **stesso buffer** della lista decodificata mostrata nella form FIFO; quindi i grafici mostrano solo i campioni effettivamente acquisiti nel pannello FIFO. Il pulsante **Clear** del pannello FIFO cancella anche i campioni decodificati; in Analyze il pulsante **Clear data** svuota lo stesso buffer.
 - **Calibrazione FTDAC**: da popup pixel (**Calibra canale…**) e da vista blocco (**Calibra canali…** per sweep MAT); riprende **Start MAT / Start CH** e interrompe in caso di errori DLL/trasporto gravi.
 - **Check Calibration**: campionamento burst + statistiche canali rumorosi; azione **Turn OFF offending channels** (PIX/FE/TDC come da implementazione corrente) quando serve ripulire dopo calibrazione.
 - **Reconnect USB**: recovery best-effort dopo errori tipo `WDU_Transfer` (bus recovery + `init_hw()` senza riscrittura TOP/MAT).
 - **Quadrant “ALL” / broadcast**: per MAT 4–7 e operazioni su intero quadrante, preferire i percorsi GUI che usano broadcast invece di I2C diretto per MAT.
+- **Save config (compatibile C#)**: nella pagina **Quadrant → Blocks** c’è **Save config…** che salva un file `.txt` nello stesso formato del tool C# (vedi `snapshot_full_configuration` in §5.9). Questo file può essere ricaricato anche dal menu *Load config* del programma C#.
 - **Clock IO board (SI5340 / SI_CLK)**: nella pagina **TOP** puoi selezionare la sorgente **SI_CLK IN** (Crystal vs SMA) e applicare un file di configurazione **SI5340** scegliendolo da `ConfigurationFiles/` (o via browse).
 
 ---

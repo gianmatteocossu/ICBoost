@@ -225,6 +225,8 @@ class Ignite64(Ignite64LowLevel):
         mats: dict[int, list[int]] = {}
         for mat_id in range(16):
             if 4 <= int(mat_id) <= 7:
+                # Placeholder: MAT 4..7 not individually readable on this bus; keep 16 sections for C# compatibility.
+                mats[mat_id] = [0] * 108
                 continue
             dev = self.matid_to_devaddr(mat_id)
             mats[mat_id] = list(self.i2c_read_bytes(dev, 0, 108))
@@ -246,8 +248,6 @@ class Ignite64(Ignite64LowLevel):
         lines.append("")
         lines.append("")
         for mat_id in range(16):
-            if 4 <= int(mat_id) <= 7:
-                continue
             lines.append(f"MAT {mat_id} ")
             lines.extend(str(int(b)) for b in mats[mat_id])
             lines.append("")
@@ -421,6 +421,38 @@ class Ignite64(Ignite64LowLevel):
             except Ignite64TransportError:
                 continue
 
+    def _set_connect2pad_only_all_quads(self, *, block: int, enable: bool = True) -> None:
+        """
+        Like `_set_connect2pad_only`, but applies to **all quadrants**.
+
+        This matches the intent of the GUI option "Connect2Pad (only this block)": at most one MAT
+        in the whole chip should have EN_CON_PAD=1 at any time.
+
+        Best-effort:
+        - Quadrants are visited one by one (mux selection).
+        - MAT 4..7 are skipped (known direct I2C issue in this wrapper).
+        """
+        quads = ("NW", "NE", "SW", "SE")
+        for q in quads:
+            try:
+                self.select_quadrant(q)
+            except Exception:
+                continue
+            for mat_id in range(16):
+                if 4 <= int(mat_id) <= 7:
+                    continue
+                dev = self.matid_to_devaddr(mat_id)
+                try:
+                    old = self.i2c_read_byte(dev, MatRegs.CAL_CONF)
+                except Ignite64TransportError:
+                    continue
+                want = 0x80 if (bool(enable) and (mat_id == int(block))) else 0x00
+                new = _update_masked_byte(old, mask=0x80, value=want)
+                try:
+                    self.i2c_write_byte(dev, MatRegs.CAL_CONF, new)
+                except Ignite64TransportError:
+                    continue
+
     def _set_connect2pad_and_probes_only(
         self,
         quad: str,
@@ -570,6 +602,23 @@ class Ignite64(Ignite64LowLevel):
         new = _update_masked_byte(old, mask=0x80, value=(v & 1) << 7)
         self.i2c_write_byte(self.addr.top_addr, reg, new)
 
+    def TopSlvsInvTx(self, inv: bool) -> None:
+        """
+        Invert SLVS TX polarity (TOP reg5 bit1).
+
+        C# mapping (`IOSetSel_Change`):
+          reg5 = 128*FE_POL + 8*FASTIN_EN + 4*SLVS_INVRX + 2*SLVS_INVTX + SLVS_TRM
+        """
+        reg = 5
+        old = self.i2c_read_byte(self.addr.top_addr, reg)
+        new = _update_masked_byte(old, mask=0x02, value=(1 if bool(inv) else 0) << 1)
+        self.i2c_write_byte(self.addr.top_addr, reg, new)
+
+    def readTopSlvsInvTx(self) -> bool:
+        """Read SLVS TX polarity invert flag (TOP reg5 bit1)."""
+        b = self.i2c_read_byte(self.addr.top_addr, 5)
+        return ((int(b) >> 1) & 1) == 1
+
     def readTopFePolarity(self) -> str:
         """
         Read FE polarity (TOP reg5 bit7).
@@ -606,6 +655,7 @@ class Ignite64(Ignite64LowLevel):
             "readout": str(self.readTopReadout()),
             "slvs": str(self.readTopSLVS()),
             "fe_polarity": str(self.readTopFePolarity()),
+            "slvs_invtx": bool(self.readTopSlvsInvTx()),
             "start_tp": tp,
             "top_reg9": int(raw[9]) if len(raw) > 9 else None,
             "top_reg10": int(raw[10]) if len(raw) > 10 else None,
@@ -897,8 +947,6 @@ class Ignite64(Ignite64LowLevel):
         else:
             code = int(self.readAnalogColumnDAC(quad, block=block, dac="VLDO")["code"])
 
-        import time
-
         for _i in range(int(max_iters)):
             v = float(self.measureVDDA(quad, block=block))
             if v >= float(target_v):
@@ -966,6 +1014,10 @@ class Ignite64(Ignite64LowLevel):
         si5340_cfg: str = "Si5340-RevD_Crystal-Registers_bis.txt",
         apply_ioext_regs: list[int] = [9, 10],
         mux_settle_s: float = 0.05,
+        verify: bool = False,
+        verify_top_n: int = 19,
+        verify_mat_n: int = 8,
+        verify_mats: Optional[list[int]] = None,
     ) -> int:
         """
         Minimal bring-up sequence (no popups): USB select -> IOext -> mux -> clock -> TOP/MATs.
@@ -1063,6 +1115,68 @@ class Ignite64(Ignite64LowLevel):
                     continue
                 dev = self.matid_to_devaddr(mat_id)
                 self._write_block_bytewise(dev, 0, data)
+
+            # Optional readback verification (lightweight; helps diagnose quadrant/mux issues).
+            if bool(verify):
+                try:
+                    v_top_n = int(verify_top_n)
+                except Exception:
+                    v_top_n = 19
+                if v_top_n < 1:
+                    v_top_n = 1
+                if v_top_n > len(cfg.top):
+                    v_top_n = len(cfg.top)
+
+                try:
+                    v_mat_n = int(verify_mat_n)
+                except Exception:
+                    v_mat_n = 8
+                if v_mat_n < 1:
+                    v_mat_n = 1
+                if v_mat_n > 108:
+                    v_mat_n = 108
+
+                if verify_mats is None:
+                    mats_to_check = [m for m in sorted(cfg.mats.keys()) if not (4 <= int(m) <= 7)]
+                    mats_to_check = mats_to_check[:4]  # keep it fast
+                else:
+                    mats_to_check = [int(m) for m in verify_mats if not (4 <= int(m) <= 7)]
+
+                mism = 0
+                # TOP readback
+                for r in range(v_top_n):
+                    try:
+                        got = int(self.i2c_read_byte(int(self.addr.top_addr), int(r))) & 0xFF
+                    except Exception as e:
+                        print(f"[VERIFY] TOP read failed quad={qq} reg={r:02d} err={e}")
+                        mism += 1
+                        continue
+                    exp = int(cfg.top[int(r)]) & 0xFF
+                    if got != exp:
+                        print(f"[VERIFY] TOP mismatch quad={qq} reg=0x{r:02X} exp=0x{exp:02X} got=0x{got:02X}")
+                        mism += 1
+
+                # MAT readback (few regs, few MATs)
+                for mat_id in mats_to_check:
+                    dev = self.matid_to_devaddr(int(mat_id))
+                    for r in range(v_mat_n):
+                        try:
+                            got = int(self.i2c_read_byte(int(dev), int(r))) & 0xFF
+                        except Exception as e:
+                            print(f"[VERIFY] MAT read failed quad={qq} mat={int(mat_id)} reg=0x{r:02X} err={e}")
+                            mism += 1
+                            continue
+                        exp = int(cfg.mats[int(mat_id)][int(r)]) & 0xFF
+                        if got != exp:
+                            print(
+                                f"[VERIFY] MAT mismatch quad={qq} mat={int(mat_id)} reg=0x{r:02X} exp=0x{exp:02X} got=0x{got:02X}"
+                            )
+                            mism += 1
+
+                if mism == 0:
+                    print(f"[VERIFY] OK quad={qq} (top_n={v_top_n} mat_n={v_mat_n} mats={mats_to_check})")
+                else:
+                    print(f"[VERIFY] FAIL quad={qq} mismatches={mism} (top_n={v_top_n} mat_n={v_mat_n} mats={mats_to_check})")
 
         return int(selected_serial)
 
@@ -1401,6 +1515,61 @@ class Ignite64(Ignite64LowLevel):
         dev = self.matid_to_devaddr(block)
         b = self.i2c_read_byte(dev, reg)
         return {"enable": (b & 0x80) != 0, "code": b & 0x7F}
+
+    def AnalogColumnENPOW(self, quad: str, *, block: int, dac: str, valore: bool) -> None:
+        """
+        Enable power for analog column DAC probing (C# EN_P_* bits).
+
+        Mapping (from C# MAT AFE group):
+          - EN_P_VTH  -> MAT reg67 bit6  (applies to VTHR_H / VTHR_L)
+          - EN_P_VLDO -> MAT reg67 bit5  (applies to VLDO)
+          - EN_P_VFB  -> MAT reg67 bit4  (applies to VFB)
+          - EN_P_VINJ -> MAT reg69 bit6  (applies to VINJ_H / VINJ_L)
+        """
+        self.select_quadrant(quad)
+        key = dac.strip().upper()
+        mat_id = int(block)
+        dev = self.matid_to_devaddr(mat_id)
+        if key in {"VTHR_H", "VTHR_L", "VTH_H", "VTH_L"}:
+            reg = MatRegs.CAL_CONF
+            mask = 0x40
+        elif key in {"VLDO"}:
+            reg = MatRegs.CAL_CONF
+            mask = 0x20
+        elif key in {"VFB", "VF"}:
+            reg = MatRegs.CAL_CONF
+            mask = 0x10
+        elif key in {"VINJ_H", "VINJH", "VINJ_L", "VINJL"}:
+            reg = MatRegs.VINJ_MUX
+            mask = 0x40
+        else:
+            raise ValueError(f"Unknown dac for EN_POW: {dac!r}")
+        old = int(self.i2c_read_byte(dev, reg)) & 0xFF
+        new = _update_masked_byte(old, mask=mask, value=(mask if bool(valore) else 0x00))
+        self.i2c_write_byte(dev, reg, int(new) & 0xFF)
+
+    def readAnalogColumnENPOW(self, quad: str, *, block: int, dac: str) -> bool:
+        """Read EN_POW for a DAC (see `AnalogColumnENPOW`)."""
+        self.select_quadrant(quad)
+        key = dac.strip().upper()
+        mat_id = int(block)
+        dev = self.matid_to_devaddr(mat_id)
+        if key in {"VTHR_H", "VTHR_L", "VTH_H", "VTH_L"}:
+            reg = MatRegs.CAL_CONF
+            mask = 0x40
+        elif key in {"VLDO"}:
+            reg = MatRegs.CAL_CONF
+            mask = 0x20
+        elif key in {"VFB", "VF"}:
+            reg = MatRegs.CAL_CONF
+            mask = 0x10
+        elif key in {"VINJ_H", "VINJH", "VINJ_L", "VINJL"}:
+            reg = MatRegs.VINJ_MUX
+            mask = 0x40
+        else:
+            raise ValueError(f"Unknown dac for EN_POW: {dac!r}")
+        b = int(self.i2c_read_byte(dev, reg)) & 0xFF
+        return (b & mask) != 0
 
     def _mat_set_dac_code(self, mat_id: int, dac: str, code: int) -> None:
         if code < 0 or code > 127:

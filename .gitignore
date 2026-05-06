@@ -46,3 +46,6 @@ Desktop.ini
 
 # --- Cursor (cache locale; le regole in .cursor/rules/ restano versionate) ---
 # (nessun ignore globale per .cursor/ — si versionano rules + contesto)
+
+# --- ICBoost local scratch ---
+icboost/trashbin/

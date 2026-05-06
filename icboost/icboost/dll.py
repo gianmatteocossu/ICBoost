@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import ctypes
-from ctypes import c_byte, c_ushort, c_int, c_uint, c_char_p, POINTER
+from ctypes import c_byte, c_ubyte, c_ushort, c_int, c_uint, c_char_p, POINTER
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -96,36 +96,36 @@ class _TcpToI2CBase:
         self.Get_DLL_Version.restype = c_int
 
         self.I2C_Read = self._lib.I2C_Read
-        self.I2C_Read.argtypes = [c_byte, c_ushort, POINTER(c_byte), c_ushort]
-        self.I2C_Read.restype = c_byte
+        self.I2C_Read.argtypes = [c_ubyte, c_ushort, POINTER(c_ubyte), c_ushort]
+        self.I2C_Read.restype = c_ubyte
 
         self.I2C_ReadArray = self._lib.I2C_ReadArray
-        self.I2C_ReadArray.argtypes = [c_byte, c_byte, c_ushort, POINTER(c_byte)]
-        self.I2C_ReadArray.restype = c_byte
+        self.I2C_ReadArray.argtypes = [c_ubyte, c_ubyte, c_ushort, POINTER(c_ubyte)]
+        self.I2C_ReadArray.restype = c_ubyte
 
         self.I2C_ReadByte = self._lib.I2C_ReadByte
-        self.I2C_ReadByte.argtypes = [c_byte, c_byte, POINTER(c_byte)]
-        self.I2C_ReadByte.restype = c_byte
+        self.I2C_ReadByte.argtypes = [c_ubyte, c_ubyte, POINTER(c_ubyte)]
+        self.I2C_ReadByte.restype = c_ubyte
 
         self.I2C_ReceiveByte = self._lib.I2C_ReceiveByte
-        self.I2C_ReceiveByte.argtypes = [c_byte, POINTER(c_byte)]
-        self.I2C_ReceiveByte.restype = c_byte
+        self.I2C_ReceiveByte.argtypes = [c_ubyte, POINTER(c_ubyte)]
+        self.I2C_ReceiveByte.restype = c_ubyte
 
         self.I2C_SendByte = self._lib.I2C_SendByte
-        self.I2C_SendByte.argtypes = [c_byte, c_byte]
-        self.I2C_SendByte.restype = c_byte
+        self.I2C_SendByte.argtypes = [c_ubyte, c_ubyte]
+        self.I2C_SendByte.restype = c_ubyte
 
         self.I2C_Write = self._lib.I2C_Write
-        self.I2C_Write.argtypes = [c_byte, c_ushort, POINTER(c_byte), c_ushort]
-        self.I2C_Write.restype = c_byte
+        self.I2C_Write.argtypes = [c_ubyte, c_ushort, POINTER(c_ubyte), c_ushort]
+        self.I2C_Write.restype = c_ubyte
 
         self.I2C_WriteArray = self._lib.I2C_WriteArray
-        self.I2C_WriteArray.argtypes = [c_byte, c_byte, c_ushort, POINTER(c_byte)]
-        self.I2C_WriteArray.restype = c_byte
+        self.I2C_WriteArray.argtypes = [c_ubyte, c_ubyte, c_ushort, POINTER(c_ubyte)]
+        self.I2C_WriteArray.restype = c_ubyte
 
         self.I2C_WriteByte = self._lib.I2C_WriteByte
-        self.I2C_WriteByte.argtypes = [c_byte, c_byte, c_byte]
-        self.I2C_WriteByte.restype = c_byte
+        self.I2C_WriteByte.argtypes = [c_ubyte, c_ubyte, c_ubyte]
+        self.I2C_WriteByte.restype = c_ubyte
 
 
 class TcpToI2CStdcall(_TcpToI2CBase):
@@ -170,12 +170,12 @@ class UsbToI2C32(ctypes.WinDLL):
 
         # Optional I2C primitives (match TCPtoI2C signatures used by our code)
         has = True
-        has &= _bind("I2C_ReadByte", [c_byte, c_byte, POINTER(c_byte)], c_byte)
-        has &= _bind("I2C_WriteByte", [c_byte, c_byte, c_byte], c_byte)
-        has &= _bind("I2C_ReadArray", [c_byte, c_byte, c_ushort, POINTER(c_byte)], c_byte)
-        has &= _bind("I2C_WriteArray", [c_byte, c_byte, c_ushort, POINTER(c_byte)], c_byte)
-        has &= _bind("I2C_SendByte", [c_byte, c_byte], c_byte)
-        has &= _bind("I2C_ReceiveByte", [c_byte, POINTER(c_byte)], c_byte)
+        has &= _bind("I2C_ReadByte", [c_ubyte, c_ubyte, POINTER(c_ubyte)], c_ubyte)
+        has &= _bind("I2C_WriteByte", [c_ubyte, c_ubyte, c_ubyte], c_ubyte)
+        has &= _bind("I2C_ReadArray", [c_ubyte, c_ubyte, c_ushort, POINTER(c_ubyte)], c_ubyte)
+        has &= _bind("I2C_WriteArray", [c_ubyte, c_ubyte, c_ushort, POINTER(c_ubyte)], c_ubyte)
+        has &= _bind("I2C_SendByte", [c_ubyte, c_ubyte], c_ubyte)
+        has &= _bind("I2C_ReceiveByte", [c_ubyte, POINTER(c_ubyte)], c_ubyte)
         self._has_i2c_primitives = bool(has)
 
         self.I2C_SetFrequency.argtypes = [c_int]

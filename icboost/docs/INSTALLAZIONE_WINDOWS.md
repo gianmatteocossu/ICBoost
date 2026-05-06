@@ -222,6 +222,7 @@ Cosa succede (semplificato):
 - **Reconnect USB**: tentativo di recovery dopo errori tipo `WDU_Transfer` (bus recovery + `init_hw()` senza riscrivere TOP/MAT).
 - Schermata **Quadrants**: foto die (se Pillow + asset), clic su quadrante o fascia TOP per dettaglio.
 - Vista **Quadrant → Blocks**: pannello FIFO, **Check Calibration** (post‑calibrazione), pulsante **FIFO…** nella vista **Block** per monitorare senza tornare al quadrante.
+- Vista **Quadrant → Blocks**: pulsante **Save config…** per salvare la configurazione corrente del quadrante in un file `.txt` **compatibile col tool C#** (stesso formato di “full configuration”).
 - Pagina **TOP**: oltre a Driver STR / Readout / SLVS / StartTP, permette anche di selezionare **SI_CLK IN** (Crystal vs SMA) e di caricare/applicare un file di configurazione **SI5340** dalla cartella `ConfigurationFiles/`.
 
 ---

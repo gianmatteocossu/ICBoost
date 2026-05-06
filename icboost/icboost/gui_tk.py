@@ -486,6 +486,7 @@ class Ignite64Gui(tk.Tk):
         self._quadrants_mon_job: Optional[str] = None
         self._quadrants_mon_seq: int = 0
         self._quad_monitor_canvas: dict[str, str] = {q: "" for q in ("NW", "NE", "SW", "SE")}
+        self._quadrants_mon_rr_idx: int = 0
         self._die_canvas_redraw: Optional[object] = None
         self._top_snapshot_texts: dict[str, tk.Text] = {}
         self._quadrants_top_mon_var = tk.StringVar(value="TOP (read): —")
@@ -502,6 +503,8 @@ class Ignite64Gui(tk.Tk):
         self._snapshot_capture_in_progress: bool = False
         self._analog_power_btn: Optional[tk.Button] = None
         self._mat_snapshot_disable_after_id: Optional[str] = None
+        # Prevent UI-freezing reentry on bulk "ALL" operations (FEON/PIXON/TDCON).
+        self._bulk_all_in_progress: bool = False
         # Cache for DCO/TDC calibration results (from Calib DCO dialog).
         # Key: (quad_str, mat_id, pix_id) -> {"dco0_ps": float, "dco1_ps": float, "lsb_ps": float}
         self._dco_calib_cache: dict[tuple[str, int, int], dict[str, float]] = {}
@@ -517,6 +520,8 @@ class Ignite64Gui(tk.Tk):
         self._quad_all_vars: dict[str, dict[str, tk.BooleanVar]] = {}
         self._blocks_view_refresh_cb: Optional[object] = None
         self._blocks_view_force_hw: bool = False
+        # Serialize compound HW sequences (select_quadrant + follow-up I2C/FIFO) vs background monitors.
+        self._hw_seq_lock = threading.Lock()
 
         # --- UI scaffold (must be created during __init__) ---
         root = ttk.Frame(self, padding=10)
@@ -546,6 +551,66 @@ class Ignite64Gui(tk.Tk):
         ttk.Button(top_right, text="Calib DCO…", command=self._calib_dco_dialog).pack(side="left", padx=(0, 4))
         ttk.Button(top_right, text="Reconnect USB", command=self._reconnect_usb).pack(side="left", padx=(0, 0))
 
+        # Verbose toggle (runtime): enables I2C trace prints in device.py
+        try:
+            self._verbose_var = tk.BooleanVar(
+                value=str(os.environ.get("ICBOOST_I2C_TRACE", "0")).strip().lower() not in {"", "0", "off", "false"}
+            )
+        except Exception:
+            self._verbose_var = tk.BooleanVar(value=False)
+
+        def _toggle_verbose() -> None:
+            try:
+                on = bool(self._verbose_var.get())
+            except Exception:
+                on = False
+            try:
+                # Default mode: errors only (avoids background monitor noise).
+                os.environ["ICBOOST_I2C_TRACE"] = "errors" if on else "0"
+                if not on:
+                    os.environ.pop("ICBOOST_I2C_TRACE_UNTIL", None)
+            except Exception:
+                pass
+            self._set_status(f"Verbose I2C trace: {'ERRORS' if on else 'OFF'}")
+            _dbg(f"Verbose I2C trace toggled -> {on}")
+
+        ttk.Checkbutton(top_right, text="Verbose", variable=self._verbose_var, command=_toggle_verbose).pack(
+            side="left", padx=(10, 0)
+        )
+
+        def _trace_3s() -> None:
+            try:
+                os.environ["ICBOOST_I2C_TRACE"] = "armed"
+                os.environ["ICBOOST_I2C_TRACE_UNTIL"] = str(time.time() + 3.0)
+            except Exception:
+                pass
+            self._set_status("I2C trace armed for 3s (all ops)")
+            _dbg("I2C trace armed for 3s")
+
+        ttk.Button(top_right, text="Trace 3s", command=_trace_3s).pack(side="left", padx=(6, 0))
+
+        # Monitor toggle (runtime): reduce I2C traffic/latency during interactive work.
+        try:
+            self._monitor_var = tk.BooleanVar(value=not _env_truthy("ICBOOST_DISABLE_MONITOR", "0"))
+        except Exception:
+            self._monitor_var = tk.BooleanVar(value=True)
+
+        def _toggle_monitor() -> None:
+            try:
+                on = bool(self._monitor_var.get())
+            except Exception:
+                on = True
+            try:
+                os.environ["ICBOOST_DISABLE_MONITOR"] = "0" if on else "1"
+            except Exception:
+                pass
+            self._set_status(f"Monitor: {'ON' if on else 'OFF'} (home refresh)")
+            _dbg(f"Monitor toggled -> {on}")
+
+        ttk.Checkbutton(top_right, text="Monitor", variable=self._monitor_var, command=_toggle_monitor).pack(
+            side="left", padx=(10, 0)
+        )
+
         # Cmd + Macro: due righe, colonna centrale larga
         cmd_macro = ttk.Frame(topbar)
         cmd_macro.pack(side="left", fill="both", expand=True, padx=(0, 12))
@@ -570,7 +635,10 @@ class Ignite64Gui(tk.Tk):
         self.content = ttk.Frame(root)
         self.content.pack(fill="both", expand=True)
 
-        self.quad_var.trace_add("write", lambda *_a: self.after_idle(self._touch_quadrants_top_mon_from_trace))
+        # No background I2C by default: keep the bus idle unless the user presses a button.
+        # Set ICBOOST_AUTO_REFRESH=1 to re-enable automatic TOP summary updates on quad change.
+        if _env_truthy("ICBOOST_AUTO_REFRESH", "0"):
+            self.quad_var.trace_add("write", lambda *_a: self.after_idle(self._touch_quadrants_top_mon_from_trace))
 
         # Show home immediately (so the window is never blank)
         self.nav_home()
@@ -1364,13 +1432,87 @@ class Ignite64Gui(tk.Tk):
             return None
         try:
             self._set_status(busy)
-            return fn()
+            with self._hw_seq_lock:
+                return fn()
         except Exception as e:
             _dbg(f"HW call failed busy={busy} err={e!r}")
             self._set_status(f"Error: {e}")
             return None
         finally:
             self.update_idletasks()
+
+    def _save_quadrant_full_config(self) -> None:
+        """
+        Save current quadrant configuration to a text file compatible with the legacy C# GUI
+        (same format as MainForm.saveFullConfigurationToString()).
+        """
+        if self.offline:
+            self._set_status("Save config: offline")
+            return
+        q = str(self.quad_var.get()).strip().upper()
+        if q not in {"SW", "NW", "SE", "NE"}:
+            self._set_status(f"Save config: bad quadrant {q!r}")
+            return
+
+        try:
+            from datetime import datetime
+
+            default_name = f"IGNITE64_config{q}_{datetime.now().strftime('%y.%m.%d.%H.%M.%S')}.txt"
+        except Exception:
+            default_name = f"IGNITE64_config{q}.txt"
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title=f"Save full configuration (Q={q})",
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All", "*.*")],
+        )
+        if not path:
+            return
+
+        # Run in background to keep UI responsive (readback is long: TOP + 16×MAT + IOext).
+        btn = getattr(self, "_btn_save_quad_cfg", None)
+        if btn is not None:
+            try:
+                btn.configure(state="disabled")
+            except Exception:
+                pass
+
+        def work() -> None:
+            err: Optional[str] = None
+            try:
+                busy_msg = f"Save full configuration (Q={q})…"
+                self.after(0, lambda: self._set_status(busy_msg))
+
+                # Avoid blocking forever if another long sequence is running.
+                if not self._hw_seq_lock.acquire(timeout=0.5):
+                    err = "HW busy (try again in a moment)"
+                    return
+                try:
+                    self.hw.snapshot_full_configuration(q, path=path)
+                finally:
+                    try:
+                        self._hw_seq_lock.release()
+                    except Exception:
+                        pass
+            except Exception as e:
+                err = str(e)
+
+            def done() -> None:
+                if err:
+                    self._set_status(f"Save config ERROR: {err}")
+                else:
+                    self._set_status(f"Saved full config (Q={q}) → {path}")
+                if btn is not None:
+                    try:
+                        btn.configure(state="normal")
+                    except Exception:
+                        pass
+
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _open_dco_cal_map(self) -> None:
         """
@@ -1711,6 +1853,10 @@ class Ignite64Gui(tk.Tk):
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
 
+        # Use the live list provided by the FIFO window (do NOT copy),
+        # so "Clear data" really clears what you will see next time.
+        data: list[dict[str, object]] = samples if isinstance(samples, list) else []
+
         # Controls
         ctrl = ttk.Frame(root)
         ctrl.grid(row=0, column=0, sticky="ew")
@@ -1755,7 +1901,45 @@ class Ignite64Gui(tk.Tk):
             except Exception:
                 return None
 
-        def _filter_samples() -> tuple[list[float], list[float]]:
+        def _d_mat(d: dict[str, object]) -> Optional[int]:
+            try:
+                v = d.get("mat", None)
+                if v is None:
+                    return None
+                return int(v)
+            except Exception:
+                return None
+
+        def _d_ch(d: dict[str, object]) -> Optional[int]:
+            # Backward compatible: accept both "channel" and legacy "ch" keys.
+            try:
+                if "channel" in d:
+                    v = d.get("channel", None)
+                    if v is None:
+                        return None
+                    return int(v)
+            except Exception:
+                pass
+            try:
+                if "ch" in d:
+                    v = d.get("ch", None)
+                    if v is None:
+                        return None
+                    return int(v)
+            except Exception:
+                pass
+            try:
+                # FIFO decoder uses "pix" for the pixel/channel id (0..63).
+                if "pix" in d:
+                    v = d.get("pix", None)
+                    if v is None:
+                        return None
+                    return int(v)
+            except Exception:
+                pass
+            return None
+
+        def _filter_samples() -> tuple[int, list[float], list[float]]:
             try:
                 want_mat = int(str(mat_var.get()).strip())
             except Exception:
@@ -1767,15 +1951,21 @@ class Ignite64Gui(tk.Tk):
             want_mat = max(0, min(15, want_mat))
             want_ch = max(0, min(63, want_ch))
 
+            matched = 0
             tas: list[float] = []
             tots: list[float] = []
-            for d in samples:
+            for d in data:
                 try:
                     if bool(use_filter.get()):
-                        if int(d.get("mat", -1) or -1) != want_mat:
+                        dm = _d_mat(d)
+                        dc = _d_ch(d)
+                        if dm is None or dc is None:
                             continue
-                        if int(d.get("channel", -1) or -1) != want_ch:
+                        if int(dm) != want_mat:
                             continue
+                        if int(dc) != want_ch:
+                            continue
+                    matched += 1
                     ta = _safe_float(d.get("ta_ps"))
                     tot = _safe_float(d.get("tot_ps"))
                     if ta is not None:
@@ -1784,16 +1974,33 @@ class Ignite64Gui(tk.Tk):
                         tots.append(float(tot))
                 except Exception:
                     continue
-            return tas, tots
+            return matched, tas, tots
 
-        def _draw_hist(cv: tk.Canvas, values: list[float], *, title: str, bins: int = 60) -> None:
+        def _draw_hist(
+            cv: tk.Canvas, values: list[float], *, title: str, matched: int, bins: int = 60
+        ) -> None:
             cv.delete("all")
             w = int(cv.winfo_width() or 800)
             h = int(cv.winfo_height() or 320)
             pad_l, pad_r, pad_t, pad_b = 50, 14, 24, 34
             cv.create_text(pad_l, 12, text=title, anchor="w", fill="#263238", font=("Segoe UI", 10, "bold"))
             if not values:
-                cv.create_text(w // 2, h // 2, text="No TA/TOT samples available (needs decoded TA/TOT).", fill="#607d8b")
+                if matched > 0:
+                    cv.create_text(
+                        w // 2,
+                        h // 2 - 10,
+                        text=f"Matched samples: {matched} (MAT/CH filter ok)",
+                        fill="#455a64",
+                        font=("Segoe UI", 10, "bold"),
+                    )
+                    cv.create_text(
+                        w // 2,
+                        h // 2 + 12,
+                        text="But TA/TOT are missing for these words (no DCO calib for that pixel, or not CAL_Mode==0).",
+                        fill="#607d8b",
+                    )
+                else:
+                    cv.create_text(w // 2, h // 2, text="No samples matched this MAT/CH.", fill="#607d8b")
                 return
             vmin = min(values)
             vmax = max(values)
@@ -1864,7 +2071,7 @@ class Ignite64Gui(tk.Tk):
             cv.create_text(x1, y1 + 18, text=f"TOT {ymin:.0f}..{ymax:.0f} ps", anchor="e", fill="#455a64", font=("Segoe UI", 9))
 
         def _refresh() -> None:
-            tas, tots = _filter_samples()
+            matched, tas, tots = _filter_samples()
             # Pair for scatter
             pairs_ta: list[float] = []
             pairs_tot: list[float] = []
@@ -1878,12 +2085,16 @@ class Ignite64Gui(tk.Tk):
                 want_ch = 0
             want_mat = max(0, min(15, want_mat))
             want_ch = max(0, min(63, want_ch))
-            for d in samples:
+            for d in data:
                 try:
                     if bool(use_filter.get()):
-                        if int(d.get("mat", -1) or -1) != want_mat:
+                        dm = _d_mat(d)
+                        dc = _d_ch(d)
+                        if dm is None or dc is None:
                             continue
-                        if int(d.get("channel", -1) or -1) != want_ch:
+                        if int(dm) != want_mat:
+                            continue
+                        if int(dc) != want_ch:
                             continue
                     ta = _safe_float(d.get("ta_ps"))
                     tot = _safe_float(d.get("tot_ps"))
@@ -1904,22 +2115,36 @@ class Ignite64Gui(tk.Tk):
                     sigma = None
             if bool(use_filter.get()):
                 stats_var.set(
-                    f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  "
+                    f"matched={matched}  samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  "
                     f"MAT={want_mat} CH={want_ch}  |  σ(TA)={sigma:.2f} ps" if sigma is not None else
-                    f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  MAT={want_mat} CH={want_ch}"
+                    f"matched={matched}  samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  MAT={want_mat} CH={want_ch}"
                 )
             else:
                 stats_var.set(
-                    f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  σ(TA)={sigma:.2f} ps"
+                    f"matched={matched}  samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}  |  σ(TA)={sigma:.2f} ps"
                     if sigma is not None
-                    else f"samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}"
+                    else f"matched={matched}  samples: TA={len(tas)} TOT={len(tots)} paired={len(pairs_ta)}"
                 )
 
-            _draw_hist(cv_ta, tas, title="TA distribution (ps)")
-            _draw_hist(cv_tot, tots, title="TOT distribution (ps)")
+            _draw_hist(cv_ta, tas, title="TA distribution (ps)", matched=matched)
+            _draw_hist(cv_tot, tots, title="TOT distribution (ps)", matched=matched)
             _draw_scatter(cv_sc, pairs_ta, pairs_tot, title="TA vs TOT (ps)")
 
         ttk.Button(ctrl, text="Analyze / refresh", command=_refresh).grid(row=0, column=6, sticky="w", padx=(12, 0))
+
+        def _clear_data() -> None:
+            data.clear()
+            # Keep controls but reset plots/stats.
+            stats_var.set("cleared")
+            try:
+                cv_ta.delete("all")
+                cv_tot.delete("all")
+                cv_sc.delete("all")
+            except Exception:
+                pass
+            _refresh()
+
+        ttk.Button(ctrl, text="Clear data", command=_clear_data).grid(row=0, column=7, sticky="w", padx=(8, 0))
 
         # Auto-refresh on resize and on filter changes.
         cv_ta.bind("<Configure>", lambda _e: _refresh())
@@ -2349,6 +2574,22 @@ class Ignite64Gui(tk.Tk):
         if self._analog_power_btn is not None:
             self._update_analog_power_button(power_ok=power_ok, power_err=power_err)
 
+    def _apply_monitor_panels_partial(
+        self,
+        quad: str,
+        st: dict[str, int],
+        *,
+        power_ok: Optional[bool],
+        power_err: Optional[str],
+    ) -> None:
+        q = str(quad).strip().upper()
+        if q not in self._quad_monitor_canvas:
+            return
+        self._quad_monitor_canvas[q] = self._format_quad_monitor_block(q, st, power_ok=power_ok, power_err=power_err)
+        self._trigger_die_canvas_refresh()
+        if self._analog_power_btn is not None:
+            self._update_analog_power_button(power_ok=power_ok, power_err=power_err)
+
     def _update_analog_power_button(self, *, power_ok: Optional[bool], power_err: Optional[str]) -> None:
         if self._analog_power_btn is None:
             return
@@ -2378,20 +2619,59 @@ class Ignite64Gui(tk.Tk):
     def _run_die_monitor_scan_async(self, seq: int) -> None:
         def work() -> None:
             try:
-                stats: dict[str, dict[str, int]] = {}
-                for q in ("NW", "NE", "SW", "SE"):
-                    stats[q] = self._gather_quad_stats(q)
+                stats_one: Optional[tuple[str, dict[str, int]]] = None
                 power_ok: Optional[bool] = None
                 power_err: Optional[str] = None
+                # Do not block interactive actions:
+                # take the HW lock only for short per-quadrant sequences; skip if busy.
+                qs = ("NW", "NE", "SW", "SE")
                 try:
-                    power_ok = bool(self.hw.readAnalogPower())
-                except Exception as e:
-                    power_err = str(e)
+                    qsel = qs[int(self._quadrants_mon_rr_idx) % len(qs)]
+                except Exception:
+                    qsel = "NW"
+                try:
+                    self._quadrants_mon_rr_idx = (int(self._quadrants_mon_rr_idx) + 1) % len(qs)
+                except Exception:
+                    self._quadrants_mon_rr_idx = 0
+
+                got = False
+                try:
+                    got = bool(self._hw_seq_lock.acquire(timeout=0.03))
+                except Exception:
+                    got = False
+                if got:
+                    try:
+                        stats_one = (qsel, self._gather_quad_stats(qsel))
+                    finally:
+                        try:
+                            self._hw_seq_lock.release()
+                        except Exception:
+                            pass
+
+                # Read Analog Power state once (best effort) without blocking.
+                got = False
+                try:
+                    got = bool(self._hw_seq_lock.acquire(timeout=0.03))
+                except Exception:
+                    got = False
+                if got:
+                    try:
+                        power_ok = bool(self.hw.readAnalogPower())
+                    except Exception as e:
+                        power_err = str(e)
+                    finally:
+                        try:
+                            self._hw_seq_lock.release()
+                        except Exception:
+                            pass
 
                 def apply() -> None:
                     if seq != self._quadrants_mon_seq:
                         return
-                    self._apply_monitor_panels_from_stats(stats, power_ok=power_ok, power_err=power_err)
+                    if stats_one is None:
+                        return
+                    q, st = stats_one
+                    self._apply_monitor_panels_partial(q, st, power_ok=power_ok, power_err=power_err)
 
                 self.after(0, apply)
             except Exception as e:
@@ -2421,12 +2701,19 @@ class Ignite64Gui(tk.Tk):
         if self.offline:
             self._apply_monitor_panels_offline()
             return
+        # Manual mode by default: do not schedule any background refresh.
+        # Use ICBOOST_AUTO_REFRESH=1 to re-enable periodic scan, or press explicit Refresh buttons.
+        if not _env_truthy("ICBOOST_AUTO_REFRESH", "0"):
+            return
+        if _env_truthy("ICBOOST_DISABLE_MONITOR", "0"):
+            return
 
         def tick() -> None:
             if not frm.winfo_exists() or seq != self._quadrants_mon_seq:
                 return
             self._run_die_monitor_scan_async(seq)
-            self._quadrants_mon_job = self.after(8000, tick)
+            # Lighter monitor: one quadrant per tick (round-robin) → full cycle in ~8s.
+            self._quadrants_mon_job = self.after(2000, tick)
 
         self._quadrants_mon_job = self.after(250, tick)
 
@@ -2463,11 +2750,12 @@ class Ignite64Gui(tk.Tk):
                 qq = self.quad_var.get().strip().upper()
                 if qq not in ("NW", "NE", "SW", "SE"):
                     qq = "SW"
-                self.hw.select_quadrant(qq)
-                d = int(self.hw.readTopDriverSTR())
-                ro = Ignite64Gui._norm_top_readout(self.hw.readTopReadout())
-                sl = Ignite64Gui._norm_top_slvs(self.hw.readTopSLVS())
-                tp = self.hw.readStartTP()
+                with self._hw_seq_lock:
+                    self.hw.select_quadrant(qq)
+                    d = int(self.hw.readTopDriverSTR())
+                    ro = Ignite64Gui._norm_top_readout(self.hw.readTopReadout())
+                    sl = Ignite64Gui._norm_top_slvs(self.hw.readTopSLVS())
+                    tp = self.hw.readStartTP()
                 rep = int(tp["repetition"])
                 st_on = "ON" if tp.get("start") else "OFF"
                 line = (
@@ -2502,6 +2790,9 @@ class Ignite64Gui(tk.Tk):
         if self.offline:
             self._quadrants_top_mon_var.set("TOP (read): OFFLINE — connect hardware.")
             return
+        # Manual mode by default: no periodic TOP reads unless ICBOOST_AUTO_REFRESH=1.
+        if not _env_truthy("ICBOOST_AUTO_REFRESH", "0"):
+            return
 
         def tick() -> None:
             if not frm.winfo_exists() or seq != self._quadrants_top_mon_seq:
@@ -2523,6 +2814,8 @@ class Ignite64Gui(tk.Tk):
             self._top_ro_var = tk.StringVar(value="i2c")
         if getattr(self, "_top_slvs_var", None) is None:
             self._top_slvs_var = tk.StringVar(value="hitor")
+        if getattr(self, "_top_invtx_var", None) is None:
+            self._top_invtx_var = tk.BooleanVar(value=False)
         if getattr(self, "_top_tp_rep_var", None) is None:
             self._top_tp_rep_var = tk.StringVar(value="1")
         if getattr(self, "_top_si_clk_in_var", None) is None:
@@ -2804,6 +3097,23 @@ class Ignite64Gui(tk.Tk):
         ttk.Button(g, text="Apply SLVS", command=apply_slvs).grid(row=r, column=3, padx=8, pady=2)
         r += 1
 
+        ttk.Label(g, text="tTX inv TX").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Checkbutton(g, variable=self._top_invtx_var).grid(row=r, column=1, sticky="w", pady=2)
+
+        def apply_invtx() -> None:
+            if self.offline:
+                return
+            try:
+                self._before_top_write()
+                self.hw.TopSlvsInvTx(bool(self._top_invtx_var.get()))
+                self._set_status(f"SLVS_INVTX applied → {int(bool(self._top_invtx_var.get()))} ({self._sel_top_apply_quad()})")
+                refresh_top_ro()
+            except Exception as e:
+                self._set_status(str(e))
+
+        ttk.Button(g, text="Apply invTX", command=apply_invtx).grid(row=r, column=3, padx=8, pady=2)
+        r += 1
+
         ttk.Label(g, text="TP repet (0–63)").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
         ttk.Spinbox(g, from_=0, to=63, textvariable=self._top_tp_rep_var, width=6).grid(row=r, column=1, sticky="w", pady=2)
 
@@ -2905,6 +3215,10 @@ class Ignite64Gui(tk.Tk):
                 self._top_drv_var.set(str(d))
                 self._top_ro_var.set(self._norm_top_readout(self.hw.readTopReadout()))
                 self._top_slvs_var.set(self._norm_top_slvs(self.hw.readTopSLVS()))
+                try:
+                    self._top_invtx_var.set(bool(self.hw.readTopSlvsInvTx()))
+                except Exception:
+                    pass
                 tp = self.hw.readStartTP()
                 self._top_tp_rep_var.set(str(int(tp["repetition"])))
                 try:
@@ -2927,7 +3241,8 @@ class Ignite64Gui(tk.Tk):
             row=r, column=0, columnspan=5, sticky="w", pady=(6, 0)
         )
 
-        if not self.offline:
+        # Manual mode: keep bus idle unless the user presses "Read TOP".
+        if (not self.offline) and _env_truthy("ICBOOST_AUTO_REFRESH", "0"):
             self.after(400, refresh_top_ro)
         else:
             self._top_status_var.set("OFFLINE")
@@ -2997,22 +3312,61 @@ class Ignite64Gui(tk.Tk):
             quad_dbg = str(self.quad_var.get()).strip().upper()
             _dbg(f"Analog Power toggle pressed (quad={quad_dbg})")
 
-            def do() -> bool:
-                cur_raw = self.hw.readAnalogPower()
-                cur = bool(cur_raw)
-                target = not cur
-                _dbg(f"Analog Power read cur_raw={cur_raw!r} cur={cur} → target={target}")
-                self.hw.setAnalogPower(target)
-                return target
+            btn = self._analog_power_btn
+            if btn is not None:
+                try:
+                    btn.configure(state="disabled")
+                except Exception:
+                    pass
 
-            new_state = self._with_hw(do, busy=f"Analog Power toggle (Q={self.quad_var.get()})")
-            if new_state is None or not isinstance(new_state, bool):
-                _dbg(f"Analog Power toggle failed new_state={new_state!r}")
-                return
+            busy_msg = f"Analog Power toggle (Q={self.quad_var.get()})"
+            self._set_status(busy_msg)
 
-            # Optimistic UI update; monitor will re-sync next tick anyway.
-            self._update_analog_power_button(power_ok=new_state, power_err=None)
-            _dbg(f"Analog Power toggle completed new_state={new_state}")
+            def work() -> None:
+                # Avoid freezing Tk: HW call runs in background thread.
+                # Use a timed lock acquire so we can fail fast if another HW sequence is stuck.
+                new_state: Optional[bool] = None
+                err_s: Optional[str] = None
+                got = False
+                try:
+                    got = bool(self._hw_seq_lock.acquire(timeout=0.5))
+                    if not got:
+                        err_s = "HW busy (lock timeout)"
+                        return
+                    cur_raw = self.hw.readAnalogPower()
+                    cur = bool(cur_raw)
+                    target = not cur
+                    _dbg(f"Analog Power read cur_raw={cur_raw!r} cur={cur} → target={target}")
+                    self.hw.setAnalogPower(target)
+                    new_state = bool(target)
+                except Exception as e:
+                    err_s = str(e)
+                    _dbg(f"Analog Power toggle failed err={e!r}")
+                finally:
+                    if got:
+                        try:
+                            self._hw_seq_lock.release()
+                        except Exception:
+                            pass
+
+                def apply() -> None:
+                    if err_s:
+                        self._set_status(f"Error: {err_s}")
+                        self._update_analog_power_button(power_ok=None, power_err=err_s)
+                    elif new_state is not None:
+                        # Optimistic UI update; monitor will re-sync next tick anyway.
+                        self._update_analog_power_button(power_ok=new_state, power_err=None)
+                        self._set_status(f"Analog Power: {'ON' if new_state else 'OFF'}")
+                        _dbg(f"Analog Power toggle completed new_state={new_state}")
+                    if btn is not None:
+                        try:
+                            btn.configure(state="normal")
+                        except Exception:
+                            pass
+
+                self.after(0, apply)
+
+            threading.Thread(target=work, daemon=True).start()
 
         # Prefer a classic tk.Button (tk/tile colors are more consistent than ttk style backgrounds).
         self._analog_power_btn = tk.Button(
@@ -3630,10 +3984,11 @@ class Ignite64Gui(tk.Tk):
             except Exception:
                 pass
             auto_after[0] = None
+            decoded_samples.clear()
             out.configure(state="normal")
             out.delete("1.0", "end")
             out.configure(state="disabled")
-            fifo_summary.set("Cleared.")
+            fifo_summary.set("Cleared (log + decoded samples).")
 
         def _fifo_read_one(decoded: bool) -> None:
             if self.offline:
@@ -3749,7 +4104,9 @@ class Ignite64Gui(tk.Tk):
         ttk.Button(btns, text="Drain (decoded)", command=lambda: _fifo_drain(decoded=True)).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="Drain (raw)", command=lambda: _fifo_drain(decoded=False)).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="Clear", command=_fifo_clear).pack(side="left", padx=(10, 0))
-        ttk.Button(btns, text="Analyze…", command=lambda qq=str(q): self._open_fifo_analyze_popup(qq, list(decoded_samples))).pack(
+        # Pass the live buffer (not a copy) so Analyze "Clear data"
+        # actually clears what you will see next time too.
+        ttk.Button(btns, text="Analyze…", command=lambda qq=str(q): self._open_fifo_analyze_popup(qq, decoded_samples)).pack(
             side="left", padx=(10, 0)
         )
         ttk.Checkbutton(btns, text="Auto", variable=auto_var, command=_toggle_auto).pack(side="left", padx=(10, 0))
@@ -4121,6 +4478,8 @@ class Ignite64Gui(tk.Tk):
             pass
         iref_bar = ttk.Frame(top)
         iref_bar.pack(fill="x", pady=(0, 8))
+        self._btn_save_quad_cfg = ttk.Button(iref_bar, text="Save config…", command=self._save_quadrant_full_config)
+        self._btn_save_quad_cfg.pack(side="right", padx=(0, 6))
         ttk.Button(iref_bar, text="Refresh", command=refresh_blocks_hw).pack(side="right", padx=(0, 6))
         ttk.Button(iref_bar, text="Check Calibration", command=lambda q=str(self.quad_var.get()).strip().upper(): self._check_calibration(q)).pack(
             side="right", padx=(0, 6)
@@ -4318,10 +4677,11 @@ class Ignite64Gui(tk.Tk):
         def clear_out() -> None:
             # Stop auto mode when clearing output.
             self._fifo_auto_stop()
+            decoded_samples.clear()
             out.configure(state="normal")
             out.delete("1.0", "end")
             out.configure(state="disabled")
-            fifo_summary_var.set("Log FIFO cancellato.")
+            fifo_summary_var.set("Cleared (log + decoded samples).")
 
         decoded_samples: list[dict[str, object]] = []
 
@@ -4426,7 +4786,9 @@ class Ignite64Gui(tk.Tk):
         ttk.Button(
             btns,
             text="Analyze…",
-            command=lambda q=str(self.quad_var.get()).strip().upper(): self._open_fifo_analyze_popup(q, list(decoded_samples)),
+            # Pass the live buffer (not a copy) so Analyze "Clear data"
+            # actually clears what you will see next time too.
+            command=lambda q=str(self.quad_var.get()).strip().upper(): self._open_fifo_analyze_popup(q, decoded_samples),
         ).pack(side="left", padx=(10, 0))
         ttk.Button(btns, text="Clear", command=clear_out).pack(side="right", padx=3)
 
@@ -4513,56 +4875,121 @@ class Ignite64Gui(tk.Tk):
                 return
 
             targets = [int(x) for x in mats]
+            if self.offline:
+                self._set_status("FTDAC ALL: offline")
+                return
+            if self._bulk_all_in_progress:
+                self._set_status("Busy: another ALL operation is running…")
+                return
 
-            def do() -> None:
+            busy = f"FTDAC ALL={code} (Q={q} block={int(block_id)})"
+            self._set_status(busy)
+            self._bulk_all_in_progress = True
+
+            def _optimistic_ui_update() -> None:
+                # Update snapshot cache + visible cells (no HW reads).
+                try:
+                    qc = self._mat_snapshot_cache.setdefault(q, {})
+                    for mid in targets:
+                        ent = qc.setdefault(int(mid), {})
+                        ent["ftdac"] = [int(code)] * 64
+                except Exception:
+                    pass
+                # Update any visible per-pixel labels in the current block view.
                 for mid in targets:
-                    # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
                     if 4 <= int(mid) <= 7:
                         continue
                     for ch in range(64):
-                        self.hw.AnalogChannelFineTune(q, block=0, mattonella=int(mid), canale=int(ch), valore=int(code))
+                        try:
+                            self._update_ftdac_cell(int(mid), int(ch), int(code))
+                        except Exception:
+                            pass
 
-            r = self._with_hw(do, busy=f"FTDAC ALL={code} (Q={q} block={int(block_id)})")
-            if r is None and not self.offline:
-                return
+            def work() -> None:
+                err_s: Optional[str] = None
+                try:
+                    with self._hw_seq_lock:
+                        self.hw.select_quadrant(q)
+                        for mid in targets:
+                            # Known chip/bus issue: MAT 4..7 addressed individually may stack the I2C bus.
+                            if 4 <= int(mid) <= 7:
+                                continue
+                            for ch in range(64):
+                                self.hw.AnalogChannelFineTune(
+                                    q, block=0, mattonella=int(mid), canale=int(ch), valore=int(code)
+                                )
+                except Exception as e:
+                    err_s = str(e)
+                    _dbg(f"FTDAC ALL failed: {e!r}")
 
-            # Update snapshot cache optimistically.
-            try:
-                qc = self._mat_snapshot_cache.setdefault(q, {})
-                for mid in targets:
-                    ent = qc.setdefault(int(mid), {})
-                    ent["ftdac"] = [int(code)] * 64
-            except Exception:
-                pass
-            try:
-                self._refresh_block(int(block_id))
-            except Exception:
-                pass
-            self._set_status(f"FTDAC ALL set to {code} (block {int(block_id)})")
+                def apply() -> None:
+                    self._bulk_all_in_progress = False
+                    if err_s:
+                        self._set_status(f"FTDAC ALL: ERROR — {err_s}")
+                        return
+                    _optimistic_ui_update()
+                    self._set_status(f"FTDAC ALL set to {code} (block {int(block_id)})")
+
+                self.after(0, apply)
+
+            threading.Thread(target=work, daemon=True).start()
 
         ttk.Button(toolbar, text="Apply", command=_apply_ftdac_all).pack(side="left")
         # ALL toggles for this block
         fe_all = tk.BooleanVar(value=False)
         px_all = tk.BooleanVar(value=False)
         td_all = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        fe_btn = ttk.Checkbutton(
             toolbar,
             text="FEON ALL",
             variable=fe_all,
-            command=lambda: self._set_block_all(block_id, feon=bool(fe_all.get())),
-        ).pack(side="left", padx=(10, 0))
-        ttk.Checkbutton(
+            command=lambda: None,
+        )
+        px_btn = ttk.Checkbutton(
             toolbar,
             text="PIXON ALL",
             variable=px_all,
-            command=lambda: self._set_block_all(block_id, pixon=bool(px_all.get())),
-        ).pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(
+            command=lambda: None,
+        )
+        td_btn = ttk.Checkbutton(
             toolbar,
             text="TDCON ALL",
             variable=td_all,
-            command=lambda: self._set_block_all(block_id, tdcon=bool(td_all.get())),
-        ).pack(side="left", padx=(6, 0))
+            command=lambda: None,
+        )
+
+        controls = [fe_btn, px_btn, td_btn]
+        fe_btn.configure(
+            command=lambda: self._block_all_toggle(
+                block_id,
+                what="FEON ALL",
+                var=fe_all,
+                controls=controls,
+                feon=bool(fe_all.get()),
+            )
+        )
+        px_btn.configure(
+            command=lambda: self._block_all_toggle(
+                block_id,
+                what="PIXON ALL",
+                var=px_all,
+                controls=controls,
+                pixon=bool(px_all.get()),
+            )
+        )
+        td_btn.configure(
+            command=lambda: self._block_all_toggle(
+                block_id,
+                what="TDCON ALL",
+                var=td_all,
+                controls=controls,
+                tdcon=bool(td_all.get()),
+            )
+        )
+
+        fe_btn.pack(side="left", padx=(10, 0))
+        px_btn.pack(side="left", padx=(6, 0))
+        td_btn.pack(side="left", padx=(6, 0))
         ttk.Button(
             toolbar,
             text="PULSE SECTION",
@@ -4601,7 +5028,7 @@ class Ignite64Gui(tk.Tk):
         analog = self._build_analog_mini(main, block_id, kind=kind)
         analog.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=4, pady=0)
 
-        self._refresh_block(block_id)
+        # Manual mode: do not auto-read on page open. Use "Refresh block" button.
         return frm
 
     def _open_fifo_popup(self, quad: str) -> None:
@@ -4738,7 +5165,9 @@ class Ignite64Gui(tk.Tk):
         ttk.Button(
             btns,
             text="Analyze…",
-            command=lambda qq=str(q).strip().upper(): self._open_fifo_analyze_popup(qq, list(decoded_samples)),
+            # Pass the live buffer (not a copy) so Analyze "Clear data"
+            # actually clears what you will see next time too.
+            command=lambda qq=str(q).strip().upper(): self._open_fifo_analyze_popup(qq, decoded_samples),
         ).pack(side="left", padx=(10, 0))
 
         auto_var = tk.BooleanVar(value=False)
@@ -5926,33 +6355,233 @@ class Ignite64Gui(tk.Tk):
 
         self._set_status(f"Pixel {pix_id}={'ON' if new_state else 'OFF'} (Q={quad} MAT={mat_id})")
 
-    def _set_block_all(self, block_id: int, *, feon: Optional[bool] = None, pixon: Optional[bool] = None, tdcon: Optional[bool] = None) -> None:
+    def _block_all_toggle(
+        self,
+        block_id: int,
+        *,
+        what: str,
+        var: tk.BooleanVar,
+        controls: list[object],
+        feon: Optional[bool] = None,
+        pixon: Optional[bool] = None,
+        tdcon: Optional[bool] = None,
+    ) -> None:
+        """
+        Debounced wrapper for FEON/PIXON/TDCON ALL toggles.
+        Prevents burst-clicks from enqueueing multiple long I2C sequences and keeps UI vars consistent.
+        """
+        desired = bool(var.get())
+        prev = not desired
+
+        if self.offline:
+            self._set_status(f"{what}: offline")
+            try:
+                var.set(prev)
+            except Exception:
+                pass
+            return
+
+        if self._bulk_all_in_progress:
+            try:
+                var.set(prev)
+            except Exception:
+                pass
+            self._set_status("Busy: ALL operation already running…")
+            return
+
+        # Disable ALL controls during the operation.
+        for w in controls:
+            try:
+                w.configure(state="disabled")  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        def _done(*, ok: bool, err: Optional[str]) -> None:
+            if not ok:
+                try:
+                    var.set(prev)
+                except Exception:
+                    pass
+                if err and err != "busy":
+                    self._set_status(f"{what}: ERROR — {err}")
+            for w in controls:
+                try:
+                    w.configure(state="normal")  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+        self._set_block_all(
+            block_id,
+            feon=feon,
+            pixon=pixon,
+            tdcon=tdcon,
+            _done_cb=_done,
+        )
+
+    def _set_block_all(
+        self,
+        block_id: int,
+        *,
+        feon: Optional[bool] = None,
+        pixon: Optional[bool] = None,
+        tdcon: Optional[bool] = None,
+        _done_cb: Optional[object] = None,
+    ) -> None:
         quad = self.quad_var.get()
         mats = self.mapping.mats_in_block(block_id)
 
-        def do() -> None:
-            self.hw.select_quadrant(quad)
+        if self.offline:
+            self._set_status("Apply ALL (offline)")
+            return
+        if self._bulk_all_in_progress:
+            self._set_status("Busy: another ALL operation is running…")
+            try:
+                if callable(_done_cb):
+                    _done_cb(ok=False, err="busy")  # type: ignore[misc]
+            except Exception:
+                pass
+            return
+
+        busy = f"Apply ALL (block={block_id} quad={str(quad).strip().upper()})"
+        self._set_status(busy)
+        self._bulk_all_in_progress = True
+        try:
+            import time as _time
+
+            t_start = float(_time.perf_counter())
+        except Exception:
+            t_start = 0.0
+
+        # Snapshot of intent for optimistic UI update after worker completes.
+        qkey = str(quad).strip().upper()
+        want_fe = None if feon is None else bool(feon)
+        want_px = None if pixon is None else bool(pixon)
+
+        def _optimistic_update() -> None:
+            # Update local cache + canvas without re-reading HW (avoid another long I2C burst).
+            try:
+                qc = self._mat_snapshot_cache.get(qkey, {})
+            except Exception:
+                qc = {}
             for mid in mats:
                 if 4 <= int(mid) <= 7:
                     continue
-                if tdcon is not None:
-                    self.hw.EnableTDC(quad, Mattonella=int(mid), enable=bool(tdcon))
-                if feon is not None or pixon is not None:
-                    for ch in range(64):
-                        if feon is not None:
-                            self.hw.setAnalogFEON(quad, mattonella=int(mid), canale=int(ch), on=bool(feon))
-                        if pixon is not None:
-                            if bool(pixon):
-                                self.hw.AnalogChannelON(quad, mattonella=int(mid), canale=int(ch))
-                            else:
-                                self.hw.AnalogChannelOFF(quad, mattonella=int(mid), canale=int(ch))
+                ent = qc.setdefault(int(mid), {})
+                po = ent.get("pix_on")
+                if not isinstance(po, list) or len(po) < 64:
+                    po = [False] * 64
+                    ent["pix_on"] = po
+                fo = ent.get("fe_on")
+                if not isinstance(fo, list) or len(fo) < 64:
+                    fo = [True] * 64
+                    ent["fe_on"] = fo
 
-        self._with_hw(do, busy=f"Apply ALL (block={block_id} quad={str(quad).strip().upper()})")
-        # Refresh this block view (updates canvas fills and ftdac labels).
-        try:
-            self._refresh_block(block_id)
-        except Exception:
-            pass
+                canvas = self._block_pix_canvas.get(int(mid))
+                rects = self._block_pix_cells.get(int(mid))
+                for ch in range(64):
+                    cur_po = bool(po[ch]) if ch < len(po) else False
+                    cur_fo = bool(fo[ch]) if ch < len(fo) else True
+                    if want_px is not None:
+                        cur_po = bool(want_px)
+                        po[ch] = bool(cur_po)
+                    if want_fe is not None:
+                        cur_fo = bool(want_fe)
+                        fo[ch] = bool(cur_fo)
+                    # Apply color policy directly (same as _update_pixel_fill_state)
+                    if canvas is not None and rects and ch < len(rects):
+                        if not bool(cur_fo):
+                            fill = "#bdbdbd"
+                        else:
+                            fill = "#1f9d55" if bool(cur_po) else "#aa2222"
+                        try:
+                            canvas.itemconfigure(rects[ch], fill=fill)
+                        except tk.TclError:
+                            pass
+
+                # Sync per-MAT ALL checkboxes (if present in this view) to match the applied intent.
+                try:
+                    mv = getattr(self, "_mat_all_vars", {}).get((qkey, int(mid)))
+                    if isinstance(mv, dict):
+                        if want_fe is not None and isinstance(mv.get("fe"), tk.BooleanVar):
+                            mv["fe"].set(bool(want_fe))
+                        if want_px is not None and isinstance(mv.get("px"), tk.BooleanVar):
+                            mv["px"].set(bool(want_px))
+                        if tdcon is not None and isinstance(mv.get("td"), tk.BooleanVar):
+                            mv["td"].set(bool(tdcon))
+                except Exception:
+                    pass
+            self._schedule_blocks_view_redraw()
+
+        def work() -> None:
+            err_s: Optional[str] = None
+            try:
+                with self._hw_seq_lock:
+                    self.hw.select_quadrant(quad)
+                    for mi, mid in enumerate(mats):
+                        if 4 <= int(mid) <= 7:
+                            continue
+                        # Coarse progress: MAT index
+                        try:
+                            self.after(0, lambda mi=mi, mid=mid: self._set_status(f"{busy} … MAT {int(mid)} ({mi+1}/{len(mats)})"))
+                        except Exception:
+                            pass
+                        if tdcon is not None:
+                            self.hw.EnableTDC(quad, Mattonella=int(mid), enable=bool(tdcon))
+                        if feon is not None or pixon is not None:
+                            for ch in range(64):
+                                # Fine progress every 8 channels to avoid spamming Tk.
+                                if (ch % 8) == 0:
+                                    try:
+                                        self.after(
+                                            0,
+                                            lambda ch=ch, mid=mid: self._set_status(
+                                                f"{busy} … MAT {int(mid)} CH {int(ch)}/63"
+                                            ),
+                                        )
+                                    except Exception:
+                                        pass
+                                if feon is not None:
+                                    self.hw.setAnalogFEON(quad, mattonella=int(mid), canale=int(ch), on=bool(feon))
+                                if pixon is not None:
+                                    if bool(pixon):
+                                        self.hw.AnalogChannelON(quad, mattonella=int(mid), canale=int(ch))
+                                    else:
+                                        self.hw.AnalogChannelOFF(quad, mattonella=int(mid), canale=int(ch))
+            except Exception as e:
+                err_s = str(e)
+                _dbg(f"Apply ALL failed: {e!r}")
+
+            def apply() -> None:
+                self._bulk_all_in_progress = False
+                try:
+                    import time as _time
+
+                    dt_s = float(_time.perf_counter() - t_start) if t_start else 0.0
+                except Exception:
+                    dt_s = 0.0
+                if err_s:
+                    self._set_status(f"Apply ALL: ERROR after {dt_s:.2f}s — {err_s}" if dt_s else f"Apply ALL: ERROR — {err_s}")
+                    try:
+                        if callable(_done_cb):
+                            _done_cb(ok=False, err=err_s)  # type: ignore[misc]
+                    except Exception:
+                        pass
+                    return
+                _optimistic_update()
+                self._set_status(
+                    f"Apply ALL: DONE in {dt_s:.2f}s (optimistic UI; use Refresh block to re-sync)"
+                    if dt_s
+                    else "Apply ALL: DONE (optimistic UI; use Refresh block to re-sync)"
+                )
+                try:
+                    if callable(_done_cb):
+                        _done_cb(ok=True, err=None)  # type: ignore[misc]
+                except Exception:
+                    pass
+
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _set_mat_all(self, mat_id: int, *, feon: Optional[bool] = None, pixon: Optional[bool] = None, tdcon: Optional[bool] = None) -> None:
         quad = self.quad_var.get()
@@ -6282,6 +6911,7 @@ class Ignite64Gui(tk.Tk):
         # Reuse the same state variables used by the full analog view.
         self._dac_vars = {}
         self._dac_en_vars = {}
+        self._dac_pow_vars = {}
         self._dac_meas_vars = {}
         self._dac_set_vars: dict[str, tk.StringVar] = {}
         self._vinjh_var = tk.StringVar(value="?")
@@ -6310,6 +6940,8 @@ class Ignite64Gui(tk.Tk):
             self._dac_vars[name] = v
             en = tk.BooleanVar(value=False)
             self._dac_en_vars[name] = en
+            pw = tk.BooleanVar(value=False)
+            self._dac_pow_vars[name] = pw
             mv = tk.StringVar(value="")
             self._dac_meas_vars[name] = mv
 
@@ -6318,6 +6950,12 @@ class Ignite64Gui(tk.Tk):
             # Keep enough room for labels like "VTHR_H" without overlapping the value.
             ttk.Label(top, text=name, width=8).pack(side="left", padx=(0, 4))
             tk.Label(top, textvariable=v, font=bold_code_font, width=4, anchor="w").pack(side="left", padx=(0, 10))
+            ttk.Checkbutton(
+                top,
+                text="EN_POW",
+                variable=pw,
+                command=lambda n=name: self._set_dac_pow(block_id, n),
+            ).pack(side="right", padx=(6, 0))
             ttk.Checkbutton(
                 top,
                 text="EN",
@@ -6489,6 +7127,7 @@ class Ignite64Gui(tk.Tk):
 
         self._dac_vars: dict[str, tk.StringVar] = {}
         self._dac_en_vars: dict[str, tk.BooleanVar] = {}
+        self._dac_pow_vars: dict[str, tk.BooleanVar] = {}
         self._dac_meas_vars: dict[str, tk.StringVar] = {}
         self._dac_set_vars: dict[str, tk.StringVar] = {}
 
@@ -6502,7 +7141,12 @@ class Ignite64Gui(tk.Tk):
             ttk.Label(row, textvariable=v, width=10).pack(side="left", padx=(6, 6))
             en = tk.BooleanVar(value=False)
             self._dac_en_vars[name] = en
+            pw = tk.BooleanVar(value=False)
+            self._dac_pow_vars[name] = pw
             ttk.Checkbutton(row, text="EN", variable=en, command=lambda n=name: self._set_dac_enable(block_id, n)).pack(
+                side="left", padx=(6, 0)
+            )
+            ttk.Checkbutton(row, text="EN_POW", variable=pw, command=lambda n=name: self._set_dac_pow(block_id, n)).pack(
                 side="left", padx=(6, 0)
             )
             sv = tk.StringVar(value="")
@@ -6579,8 +7223,14 @@ class Ignite64Gui(tk.Tk):
         def do() -> dict[str, object]:
             self.hw.select_quadrant(quad)
             out: dict[str, object] = {}
+            pow_out: dict[str, bool] = {}
             for name in ["VTHR_H", "VTHR_L", "VINJ_H", "VINJ_L", "VLDO", "VFB"]:
                 out[name] = self.hw.readAnalogColumnDAC(quad, block=owner, dac=name)
+                try:
+                    pow_out[name] = bool(self.hw.readAnalogColumnENPOW(quad, block=owner, dac=name))
+                except Exception:
+                    pow_out[name] = False
+            out["pow"] = pow_out
             out["vinj"] = self.hw.readAnalogColumnVinjMux(quad, block=owner)
             out["c2p"] = bool(self.hw.readAnalogColumnConnect2PAD(quad, block=owner))
             if hasattr(self, "_afe_csa_var"):
@@ -6595,7 +7245,7 @@ class Ignite64Gui(tk.Tk):
         if r is None:
             return
         for name, val in r.items():
-            if name in {"vinj", "c2p", "bias"} or str(name).startswith("meas_"):
+            if name in {"vinj", "c2p", "bias", "pow"} or str(name).startswith("meas_"):
                 continue
             d = val  # type: ignore[assignment]
             try:
@@ -6614,9 +7264,23 @@ class Ignite64Gui(tk.Tk):
                 self._dac_vars[name].set("?")
                 self._dac_en_vars[name].set(False)
                 try:
+                    self._dac_pow_vars[name].set(False)
+                except Exception:
+                    pass
+                try:
                     self._dac_meas_vars[name].set("")  # type: ignore[index]
                 except Exception:
                     pass
+
+        # EN_POW flags
+        pow_d = r.get("pow")
+        if isinstance(pow_d, dict):
+            for name, v in pow_d.items():
+                if str(name) in getattr(self, "_dac_pow_vars", {}):
+                    try:
+                        self._dac_pow_vars[str(name)].set(bool(v))
+                    except Exception:
+                        pass
 
         vinj = r.get("vinj", {})  # type: ignore[assignment]
         try:
@@ -6690,21 +7354,8 @@ class Ignite64Gui(tk.Tk):
             meas_v = None
             meas_mv = None
             if ch is not None:
-                # Ensure connect-to-pad is enabled ONLY for this block before ADC sampling,
-                # matching the C# workflow (otherwise ADC may be reading a different MAT).
-                try:
-                    en_vth = dac.strip().upper() in {"VTHR_H", "VTHR_L", "VINJ_H"}
-                    en_vldo = dac.strip().upper() == "VLDO"
-                    en_vfb = dac.strip().upper() in {"VFB", "VF"}
-                    self.hw._set_connect2pad_and_probes_only(  # type: ignore[attr-defined]
-                        quad,
-                        block=owner,
-                        en_p_vth=en_vth,
-                        en_p_vldo=en_vldo,
-                        en_p_vfb=en_vfb,
-                    )
-                except Exception:
-                    pass
+                # Do NOT force "only this block" probe routing here:
+                # it can unexpectedly disable EN_CON_PAD / EN_POW on other blocks.
                 # Give analog mux/probe some settle time before sampling.
                 time.sleep(0.02)
                 r = self.hw._adc_quad_oneshot(channel=ch, gain=0, res_bits=16, delay_s=0.03)  # type: ignore[attr-defined]
@@ -6758,6 +7409,17 @@ class Ignite64Gui(tk.Tk):
         self._with_hw(do, busy=f"{'Enable' if en else 'Disable'} {dac} (Q={quad} ownerMAT={owner})")
         self._refresh_analog(block_id)
 
+    def _set_dac_pow(self, block_id: int, dac: str) -> None:
+        quad = self.quad_var.get()
+        owner = self.mapping.analog_owner_mat(block_id)
+        pw = bool(self._dac_pow_vars[dac].get())
+
+        def do() -> None:
+            self.hw.AnalogColumnENPOW(quad, block=owner, dac=dac, valore=pw)
+
+        self._with_hw(do, busy=f"{'Enable' if pw else 'Disable'} EN_POW {dac} (Q={quad} ownerMAT={owner})")
+        self._refresh_analog(block_id)
+
     def _set_vinj(self, block_id: int, vinj: str, valore: str) -> None:
         quad = self.quad_var.get()
         owner = self.mapping.analog_owner_mat(block_id)
@@ -6773,11 +7435,9 @@ class Ignite64Gui(tk.Tk):
         owner = self.mapping.analog_owner_mat(block_id)
 
         def do() -> None:
-            # Use helper which ensures only one is enabled if available
-            if enable:
-                self.hw._set_connect2pad_only(quad, block=owner)  # type: ignore[attr-defined]
-            else:
-                self.hw.AnalogColumnConnect2PAD(quad, block=owner, valore=False)
+            # Do not enforce "only this block" exclusivity: it may disable other blocks' analog probing.
+            # Only touch the current quadrant + owner MAT.
+            self.hw.AnalogColumnConnect2PAD(quad, block=owner, valore=bool(enable))
 
         self._with_hw(do, busy=f"Connect2Pad={'ON' if enable else 'OFF'} (Q={quad} ownerMAT={owner})")
         self._refresh_analog(block_id)
@@ -6808,7 +7468,13 @@ def run_gui(
     si5340_config_file: Optional[str] = None,
 ) -> None:
     offline = _env_truthy("OFFLINE", "0")
-    hw = Ignite64()
+    # Ensure native DLLs can be resolved: prefer the repo `icboost/` directory.
+    # (Both TCPtoI2C.dll and USBtoI2C32.dll live there in this repo.)
+    try:
+        _repo_dir = Path(__file__).resolve().parents[1]
+    except Exception:
+        _repo_dir = None
+    hw = Ignite64(dll_dir=(str(_repo_dir) if _repo_dir is not None else None))
     q0 = str(default_quad).strip().upper()
 
     def _resolve_full_cfg_path() -> Optional[Path]:
@@ -6834,15 +7500,10 @@ def run_gui(
         """
         try:
             hw.select_quadrant(q0)
-            try:
-                hw.TopReadout("i2c")
-            except Exception:
-                pass
-            # Minimal reachability check: TOP + MAT0 few bytes.
-            _ = list(hw.i2c_read_bytes(hw.addr.top_addr, 0, 2))
-            dev0 = hw.matid_to_devaddr(0)
-            _ = int(hw.i2c_read_byte(dev0, 0)) & 0xFF
-            _ = int(hw.i2c_read_byte(dev0, 64)) & 0xFF
+            # Minimal reachability check: TOP must respond.
+            # Do NOT require MAT reads here: they can fail if readout path is not I2C yet.
+            _ = int(hw.i2c_read_byte(hw.addr.top_addr, 4)) & 0xFF  # driver strength / CMM mode
+            _ = int(hw.i2c_read_byte(hw.addr.top_addr, 5)) & 0xFF  # IO set selection (invtx/invrx/fe_pol…)
             return True
         except Exception:
             return False
@@ -6864,6 +7525,11 @@ def run_gui(
                     q0,
                     full_cfg=base_config_file,
                     si5340_cfg=str(si5340_config_file or "Si5340-RevD_Crystal-Registers_bis.txt"),
+                    # IMPORTANT: AUTO must be non-invasive.
+                    # If the setup is already configured (clock + TOP/MAT), do not reprogram IOext/clock/unlock.
+                    do_ioext_defaults=False,
+                    do_clock=False,
+                    do_unlock_top_dc=False,
                 )
             except Exception as e:
                 _dbg(f"AUTO init_hw failed: {e!r}")
@@ -6886,8 +7552,9 @@ def run_gui(
             did_write_config = True
     app = Ignite64Gui(hw, default_quad=default_quad, offline=offline)
 
-    # Start snapshot prefill AFTER GUI is responsive (avoid blank/unresponsive window on Windows).
-    if not offline:
+    # Manual mode by default: keep I2C bus idle unless user explicitly refreshes.
+    # Set ICBOOST_AUTO_SNAPSHOT=1 to re-enable startup snapshot activity.
+    if (not offline) and _env_truthy("ICBOOST_AUTO_SNAPSHOT", "0"):
         if did_write_config:
             app.after(50, lambda: app._start_initial_snapshot_prefill(default_quad, base_config_file))
         else:

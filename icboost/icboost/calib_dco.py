@@ -7,6 +7,7 @@ Requires FIFO readout via I2C (`TopReadout("i2c")`) and the same mux/quadrant se
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -204,21 +205,15 @@ def read_until_empty(
 ) -> int:
     """Mirror `ReadUntilEmpty(ushort, ushort, bool, ...)` (C#)."""
     n_read = 0
-    cons_err = 0
     keep_going = True
     while keep_going:
-        num = int(hw.FifoReadSingle())
-        if num == 0:
-            n_read += 1
-            cons_err += 1
-            time.sleep(0.001)
-            continue
-        if n_read % 4 == 0:
-            cons_err = 0
-        if cons_err == 3:
+        rc, w = hw._fifo_top_read_u64_rc()
+        if rc == 3:
+            # FIFO empty per vendor rc==3 (distinct from a legitimate all-zero word).
             keep_going = False
             time.sleep(0.001)
             continue
+        num = int(w)
         num2 = int((num >> 48) & 0xFF)
         if num2 < 1:
             keep_going = False
@@ -286,8 +281,12 @@ def _mat_cal_conf_no_ui(
     cal_time: Optional[int] = None,
 ) -> None:
     waddr = _mat_write_addr(mat_id)
-    raddr = _mat_read_addr(mat_id)
-    old = hw.i2c_read_byte(raddr, _REG_CAL_CONF)
+    if int(mat_id) > 15:
+        # Broadcast / non-addressable MAT id: no valid read address — build from args only.
+        old = 0
+    else:
+        raddr = _mat_read_addr(mat_id)
+        old = hw.i2c_read_byte(raddr, _REG_CAL_CONF)
     value = bool(old & 0x80) if en_con_pad is None else en_con_pad
     value2 = bool(old & 0x40) if en_p_vth is None else en_p_vth
     value3 = bool(old & 0x20) if en_p_vldo is None else en_p_vldo
@@ -317,8 +316,11 @@ def _mat_tdc_dco0_conf_no_ui(
     ctrl: Optional[int] = None,
 ) -> None:
     waddr = _mat_write_addr(mat_id)
-    raddr = _mat_read_addr(mat_id)
-    old = hw.i2c_read_byte(raddr, _REG_TDC_DCO0)
+    if int(mat_id) > 15:
+        old = 0
+    else:
+        raddr = _mat_read_addr(mat_id)
+        old = hw.i2c_read_byte(raddr, _REG_TDC_DCO0)
     value = bool(old & 0x80) if de_on is None else de_on
     value2 = bool(old & 0x40) if tdcon is None else tdcon
     num2 = (old >> 4) & 3 if adj is None else int(adj) & 3
@@ -363,9 +365,12 @@ def _mat_pixel_conf_no_ui(
     ctrl: Optional[int] = None,
 ) -> None:
     waddr = _mat_write_addr(mat_id)
-    raddr = _mat_read_addr(mat_id)
     reg = int(pix_id) & 0xFF
-    old = hw.i2c_read_byte(raddr, reg)
+    if int(mat_id) > 15:
+        old = 0
+    else:
+        raddr = _mat_read_addr(mat_id)
+        old = hw.i2c_read_byte(raddr, reg)
     value = bool(old & 0x80) if fe_on is None else fe_on
     value2 = bool(old & 0x40) if pix_on is None else pix_on
     num2 = (old >> 4) & 3 if adj is None else int(adj) & 3
@@ -588,14 +593,13 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
                 _mat_cal_conf_no_ui(hw, i_m, cal_mode=True, cal_time=cal_time)
                 _mat_tdc_dco0_conf_no_ui(hw, i_m, de_on=enable_de, tdcon=ON, adj=single_adj, ctrl=single_ctrl)
 
-                if all_pix and mat_num == 17:
+                if all_pix and mat_num == 16:
                     pix_min = 0
                     pix_max = 63
 
                 # Progress knobs (keep terminal readable)
-                import os as _os
                 try:
-                    pix_every = int(_os.environ.get("IGNITE64_CALIB_PIX_PROGRESS_EVERY", "").strip() or "4")
+                    pix_every = int(os.environ.get("IGNITE64_CALIB_PIX_PROGRESS_EVERY", "").strip() or "4")
                 except Exception:
                     pix_every = 4
                 if pix_every < 1:
@@ -609,11 +613,11 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
                     # Retry the whole DCO0-measurement step for this pixel instead of skipping
                     # on the first transient rc=1 from the USB/I2C DLL.
                     try:
-                        pix_retries = int(_os.environ.get("IGNITE64_CALIB_PIXEL_RETRIES", "").strip() or "12")
+                        pix_retries = int(os.environ.get("IGNITE64_CALIB_PIXEL_RETRIES", "").strip() or "12")
                     except Exception:
                         pix_retries = 12
                     try:
-                        pix_backoff_s = float(_os.environ.get("IGNITE64_CALIB_PIXEL_BACKOFF_S", "").strip() or "0.02")
+                        pix_backoff_s = float(os.environ.get("IGNITE64_CALIB_PIXEL_BACKOFF_S", "").strip() or "0.02")
                     except Exception:
                         pix_backoff_s = 0.02
                     pix_retries = max(1, int(pix_retries))
@@ -670,11 +674,11 @@ def run_calib_dco_body(hw, params: CalibDCOParams, *, progress: Optional[Callabl
 
                         # Retry this AdjCtrl step a few times; only then move on.
                         try:
-                            adj_retries = int(_os.environ.get("IGNITE64_CALIB_ADJ_RETRIES", "").strip() or "8")
+                            adj_retries = int(os.environ.get("IGNITE64_CALIB_ADJ_RETRIES", "").strip() or "8")
                         except Exception:
                             adj_retries = 8
                         try:
-                            adj_backoff_s = float(_os.environ.get("IGNITE64_CALIB_ADJ_BACKOFF_S", "").strip() or "0.02")
+                            adj_backoff_s = float(os.environ.get("IGNITE64_CALIB_ADJ_BACKOFF_S", "").strip() or "0.02")
                         except Exception:
                             adj_backoff_s = 0.02
                         adj_retries = max(1, int(adj_retries))
